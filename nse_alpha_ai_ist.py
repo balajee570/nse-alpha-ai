@@ -10,7 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from tavily import TavilyClient
 
-IST = ZoneInfo(“Asia/Kolkata”)
+IST = ZoneInfo("Asia/Kolkata")
 
 # =============================
 
