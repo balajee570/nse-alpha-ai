@@ -827,9 +827,9 @@ if "strategy" in st.session_state:
             return "color:#f87171;font-weight:700" if val > RSI_OVERBOUGHT else ""
         st.dataframe(
             momentum_df.style
-                .applymap(color_signal,    subset=["Signal"])
-                .applymap(color_upside,    subset=["Upside %"])
-                .applymap(color_rsi_stock, subset=["RSI"])
+                .map(color_signal,    subset=["Signal"])
+                .map(color_upside,    subset=["Upside %"])
+                .map(color_rsi_stock, subset=["RSI"])
                 .format({
                     "Price":"Rs.{:.2f}","MA50":"Rs.{:.2f}","Target":"Rs.{:.2f}",
                     "52W High":"Rs.{:.2f}","RSI":"{:.1f}","Vol Ratio":"{:.2f}x",
