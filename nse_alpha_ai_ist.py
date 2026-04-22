@@ -229,7 +229,7 @@ st.markdown(f"""
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
+def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
     headers  = {"Authorization": f"Bearer {SARVAM_API_KEY}", "Content-Type": "application/json"}
     messages = []
     if system:
@@ -546,7 +546,7 @@ Current Nifty and Bank Nifty levels, USD/INR rate, RBI stance, FII/DII flows.
 
 Keep each section to 3-4 sentences. No filler.
 """
-    result = call_ai(prompt, system=system, max_tokens=6000)
+    result = call_ai(prompt, system=system, max_tokens=4096)
     return result if result.strip() else "Market intelligence could not be generated."
 
 def build_sector_heatmap(df: pd.DataFrame) -> pd.DataFrame:
@@ -645,7 +645,7 @@ One ticker per row, exactly 3 rows.
 **AVOID** 2 bullets, not Top 3 picks.
 **TAIL RISKS** 2 bullets."""
 
-    result = call_ai(prompt, system=system, max_tokens=6000)
+    result = call_ai(prompt, system=system, max_tokens=4096)
     if result.strip():
         return result
 
@@ -655,7 +655,7 @@ MACRO:{macro_facts[:300]}
 STOCK SCAN (picks must come ONLY from here, no ETFs):{stocks_short[:400]}
 Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN only. **AVOID** 2 bullets."""
 
-    result = call_ai(mini, system=system, max_tokens=6000)
+    result = call_ai(mini, system=system, max_tokens=4096)
     return result if result.strip() else "Strategy unavailable - API timeout. Scan data above is valid."
 
 def best_upside_picks(df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
