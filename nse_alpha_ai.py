@@ -376,6 +376,29 @@ SECTOR_MAP = {
     "NAVINFLUOR":"Chemicals","ATUL":"Chemicals",
 }
 
+# NSE sector indices — used by Sector Leadership Engine (Z2). Maps the
+# SECTOR_MAP sector names to their NSE index ticker on yfinance. Sectors
+# without a clean index (e.g. Defence, Railways — there's no single NSE
+# index for these themes) are intentionally absent; their member stocks
+# still get sector_in_top5=False by default until we add thematic baskets.
+SECTOR_INDICES = {
+    "Banking":     "^NSEBANK",
+    "Finance":     "^CNXFIN",
+    "IT":          "^CNXIT",
+    "Pharma":      "^CNXPHARMA",
+    "Healthcare":  "^CNXPHARMA",
+    "Auto":        "^CNXAUTO",
+    "Metals":      "^CNXMETAL",
+    "Energy":      "^CNXENERGY",
+    "FMCG":        "^CNXFMCG",
+    "Realty":      "^CNXREALTY",
+    "Media":       "^CNXMEDIA",
+    "Infra":       "^CNXINFRA",
+    "CapGoods":    "^CNXINFRA",
+    "Telecom":     "^CNXMEDIA",
+    # No clean index: Defence, Chemicals — surfaced via per-stock data only.
+}
+
 # =============================
 # PAGE CONFIG
 # =============================
@@ -916,17 +939,37 @@ def classify_stage(m: dict) -> tuple:
     return 0, STAGE_LABELS[0]
 
 def estimate_upside(df: pd.DataFrame, price: float, high20: float) -> dict:
-    high52 = df["High"].iloc[-252:].max() if len(df) >= 252 else df["High"].max()
-    low52  = df["Low"].iloc[-252:].min()  if len(df) >= 252 else df["Low"].min()
-    atr_target = price + 2 * (compute_atr_pct(df) / 100 * price)
-    fib_target = low52 + (high52 - low52) * 1.618
-    targets    = [t for t in [high52, atr_target, fib_target] if t > price * 1.02]
-    target     = round(min(targets), 2) if targets else round(price * 1.12, 2)
+    """Conservative price target = min of three candidates (52W high, capped
+    ATR projection, capped Fibonacci extension). All candidates explicitly
+    sanity-bounded to [1.02×price, 3.0×price]. Falls back to +12% if nothing
+    qualifies. Handles NaN/None price gracefully."""
+    if not (isinstance(price, (int, float)) and np.isfinite(price) and price > 0):
+        return {"target": None, "upside_pct": None, "high52": None, "high52_gap_pct": None}
+
+    high52 = float(df["High"].iloc[-252:].max() if len(df) >= 252 else df["High"].max())
+    low52  = float(df["Low"].iloc[-252:].min()  if len(df) >= 252 else df["Low"].min())
+    atrp   = compute_atr_pct(df)
+
+    # Cap ATR-based target: 2×ATR% capped at 25% (so very-high-ATR micro-caps
+    # don't produce silly 40%+ projections from a single-day-vol number).
+    atr_pct_capped = min(float(atrp), 25.0) if (atrp is not None and np.isfinite(atrp)) else 0.0
+    atr_target = price * (1 + 2 * atr_pct_capped / 100) if atr_pct_capped > 0 else np.nan
+
+    # Fibonacci 1.618 extension — kept for completeness but capped at 2×price.
+    if np.isfinite(low52) and np.isfinite(high52) and high52 > low52:
+        fib_raw = low52 + (high52 - low52) * 1.618
+        fib_target = min(fib_raw, price * 2.0)
+    else:
+        fib_target = np.nan
+
+    candidates = [t for t in [high52, atr_target, fib_target]
+                  if np.isfinite(t) and price * 1.02 < t < price * 3.0]
+    target = round(min(candidates), 2) if candidates else round(price * 1.12, 2)
     return {
         "target"        : target,
         "upside_pct"    : round((target - price) / price * 100, 1),
-        "high52"        : round(high52, 2),
-        "high52_gap_pct": round((high52 - price) / price * 100, 1),
+        "high52"        : round(high52, 2) if np.isfinite(high52) else None,
+        "high52_gap_pct": round((high52 - price) / price * 100, 1) if np.isfinite(high52) else None,
     }
 
 # =============================
@@ -1053,6 +1096,343 @@ def get_nifty_close(period: str = "1y") -> pd.Series:
     except Exception:
         return pd.Series(dtype=float)
 
+# =============================
+# MARKET REGIME + SECTOR LEADERSHIP (Z1 + Z2)
+# =============================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_india_vix() -> float:
+    try:
+        h = _yf_ticker("^INDIAVIX").history(period="5d", interval="1d")
+        if h.empty: return float("nan")
+        return float(h["Close"].iloc[-1])
+    except Exception:
+        return float("nan")
+
+def compute_market_regime(nifty_close: pd.Series, scan_df: pd.DataFrame) -> dict:
+    """Score the market regime 0-100 from Nifty technicals + VIX + breadth.
+    AGGRESSIVE >=70, SELECTIVE 50-69, DEFENSIVE <50."""
+    out = {
+        "nifty_above_50dma": False, "nifty_above_200dma": False,
+        "nifty_50dma_slope_20d": 0.0, "vix_level": float("nan"),
+        "vix_band": "—", "breadth_above_ma50_pct": 0.0,
+        "breadth_above_ma200_pct": 0.0, "at_52w_high_pct": 0.0,
+        "score": 0.0, "label": "DEFENSIVE", "multiplier": 0.70,
+    }
+    if nifty_close is None or nifty_close.empty:
+        return out
+    try:
+        ma50  = nifty_close.rolling(50).mean()
+        ma200 = nifty_close.rolling(200).mean()
+        last  = float(nifty_close.iloc[-1])
+        out["nifty_above_50dma"]  = bool(np.isfinite(ma50.iloc[-1])  and last > ma50.iloc[-1])
+        out["nifty_above_200dma"] = bool(np.isfinite(ma200.iloc[-1]) and last > ma200.iloc[-1])
+        if len(ma50.dropna()) >= 21:
+            sl = slope_pct(ma50.dropna(), 20)
+            out["nifty_50dma_slope_20d"] = float(sl) if np.isfinite(sl) else 0.0
+    except Exception:
+        pass
+
+    vix = get_india_vix()
+    out["vix_level"] = vix
+    if np.isfinite(vix):
+        out["vix_band"] = "Low" if vix < 14 else ("Normal" if vix < 22 else "High")
+
+    if scan_df is not None and not scan_df.empty:
+        try:
+            out["breadth_above_ma50_pct"]  = float((scan_df["Dist MA50 %"]  > 0).mean() * 100)
+            out["breadth_above_ma200_pct"] = float((scan_df["Dist MA200 %"] > 0).mean() * 100)
+            out["at_52w_high_pct"]         = float((scan_df["Gap to 52W %"].abs() < 2).mean() * 100)
+        except Exception:
+            pass
+
+    vix_factor = 1.0 if (np.isfinite(vix) and vix < 14) else (
+                 0.6 if (np.isfinite(vix) and vix < 22) else 0.2)
+    score = 100 * (
+        0.25 * (1.0 if out["nifty_above_50dma"]  else 0.0) +
+        0.25 * (1.0 if out["nifty_above_200dma"] else 0.0) +
+        0.15 * (1.0 if out["nifty_50dma_slope_20d"] > 0 else 0.0) +
+        0.15 * vix_factor +
+        0.10 * min(out["breadth_above_ma50_pct"]  / 100, 1.0) +
+        0.10 * min(out["breadth_above_ma200_pct"] / 100, 1.0)
+    )
+    out["score"] = round(score, 1)
+    if score >= 70:    out["label"], out["multiplier"] = "AGGRESSIVE", 1.00
+    elif score >= 50:  out["label"], out["multiplier"] = "SELECTIVE", 0.85
+    else:              out["label"], out["multiplier"] = "DEFENSIVE", 0.70
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sector_strength_raw(symbols: tuple) -> dict:
+    """Cached batch fetch of sector indices (key = sector name from
+    SECTOR_INDICES, value = dict of computed metrics)."""
+    out: dict = {}
+    try:
+        data = _yf_download(list(symbols), period="6mo", interval="1d",
+                            group_by="ticker", threads=True, progress=False,
+                            auto_adjust=True)
+    except Exception:
+        return out
+
+    for sym in symbols:
+        try:
+            df = data[sym] if len(symbols) > 1 else data
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna(subset=["Close"])
+            if len(df) < 22:
+                continue
+            close = df["Close"]
+            last  = float(close.iloc[-1])
+            ret_1m = float(close.iloc[-1] / close.iloc[-min(22, len(close)-1) - 1] - 1) * 100 if len(close) > 22 else float("nan")
+            ret_3m = float(close.iloc[-1] / close.iloc[-min(63, len(close)-1) - 1] - 1) * 100 if len(close) > 63 else float("nan")
+            ret_6m = float(close.iloc[-1] / close.iloc[ 0] - 1) * 100
+            ma50  = close.rolling(50).mean()
+            ma200 = close.rolling(200).mean() if len(close) >= 200 else None
+            above_50  = bool(np.isfinite(ma50.iloc[-1])  and last > ma50.iloc[-1])
+            above_200 = bool(ma200 is not None and np.isfinite(ma200.iloc[-1]) and last > ma200.iloc[-1])
+            out[sym] = {
+                "ret_1m": ret_1m, "ret_3m": ret_3m, "ret_6m": ret_6m,
+                "above_50dma": above_50, "above_200dma": above_200,
+                "last": last,
+            }
+        except Exception:
+            continue
+    return out
+
+
+def compute_sector_strength(scan_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build a ranked sector strength table. Returns DataFrame with one row
+    per known sector and a `Rank` + `Status` column. Top-5 ranks get the
+    sector_in_top5 bonus during scoring."""
+    if not SECTOR_INDICES:
+        return pd.DataFrame()
+    syms = tuple(sorted(set(SECTOR_INDICES.values())))
+    raw  = fetch_sector_strength_raw(syms)
+    rows = []
+    # Map symbol back to sector NAMES (multiple sectors can share an index)
+    sym_to_sectors: dict = {}
+    for sector, sym in SECTOR_INDICES.items():
+        sym_to_sectors.setdefault(sym, []).append(sector)
+
+    breadth: dict = {}
+    if scan_df is not None and not scan_df.empty and "Ticker" in scan_df.columns:
+        for _, r in scan_df.iterrows():
+            sec = SECTOR_MAP.get(r["Ticker"])
+            if sec: breadth[sec] = breadth.get(sec, 0) + 1
+
+    for sym, m in raw.items():
+        for sec in sym_to_sectors.get(sym, []):
+            rows.append({
+                "Sector":      sec,
+                "Index":       sym,
+                "1M %":        round(m["ret_1m"], 2) if np.isfinite(m.get("ret_1m", float("nan"))) else None,
+                "3M %":        round(m["ret_3m"], 2) if np.isfinite(m.get("ret_3m", float("nan"))) else None,
+                "6M %":        round(m["ret_6m"], 2) if np.isfinite(m.get("ret_6m", float("nan"))) else None,
+                "Above 50DMA":  bool(m.get("above_50dma")),
+                "Above 200DMA": bool(m.get("above_200dma")),
+                "Breadth":     int(breadth.get(sec, 0)),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates("Sector").reset_index(drop=True)
+
+    def _sec_score(r):
+        r1 = r["1M %"] or 0; r3 = r["3M %"] or 0
+        dma = (1.0 if r["Above 50DMA"] else 0) + (1.0 if r["Above 200DMA"] else 0)
+        brd = min((r["Breadth"] or 0) / 20.0, 1.0)
+        return 100 * (
+            0.4 * np.tanh(r3 / 20) +    # 3M return (squashed)
+            0.3 * np.tanh(r1 / 10) +    # 1M return (squashed)
+            0.2 * (dma / 2.0) +
+            0.1 * brd
+        )
+
+    df["Score"] = df.apply(_sec_score, axis=1).round(1)
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    df["Rank"] = df.index + 1
+    df["Status"] = df["Rank"].apply(lambda r: "In play" if r <= 5
+                                              else ("Watch" if r <= 10 else "Laggard"))
+    return df
+
+
+def top_sectors_set(sector_df: pd.DataFrame, top_n: int = 5) -> set:
+    if sector_df is None or sector_df.empty:
+        return set()
+    return set(sector_df.head(top_n)["Sector"].tolist())
+
+
+# =============================
+# BASE PATTERN DETECTION (Z4)
+# VCP, Flat Base, Cup-and-Handle. Each returns either None or
+# {"name", "quality", "key_levels"}.
+# =============================
+
+def _find_swing_extrema(series: pd.Series, window: int = 5) -> tuple:
+    """Return (highs_idx, lows_idx) — positions of local maxima/minima.
+    A swing high at i requires series[i] >= series[i-w:i+w+1].max()."""
+    vals = series.values
+    n = len(vals)
+    highs, lows = [], []
+    if n < 2 * window + 1:
+        return highs, lows
+    for i in range(window, n - window):
+        seg = vals[i - window:i + window + 1]
+        if vals[i] == seg.max() and (vals[i] > seg.min()):
+            highs.append(i)
+        elif vals[i] == seg.min() and (vals[i] < seg.max()):
+            lows.append(i)
+    return highs, lows
+
+
+def detect_vcp(close: pd.Series, volume: pd.Series, lookback: int = 60) -> dict | None:
+    """Volatility Contraction Pattern: 3+ progressively tighter pullbacks
+    on declining volume, current price near most recent pivot high."""
+    if close is None or len(close) < lookback + 5:
+        return None
+    c = close.iloc[-lookback:]; v = volume.iloc[-lookback:]
+    highs, lows = _find_swing_extrema(c, window=3)
+    if len(highs) < 3 or len(lows) < 3:
+        return None
+
+    # Build sequence of (peak_idx, trough_idx) pairs in order.
+    pivots = sorted([(i, "H") for i in highs] + [(i, "L") for i in lows])
+    pullbacks = []   # list of (peak_close, trough_close, avg_vol_during_pullback)
+    last_h = None
+    for idx, kind in pivots:
+        if kind == "H":
+            last_h = (idx, float(c.iloc[idx]))
+        elif kind == "L" and last_h is not None:
+            ph_idx, ph = last_h
+            tl_idx, tl = idx, float(c.iloc[idx])
+            if ph_idx >= tl_idx: continue
+            depth = (ph - tl) / ph if ph > 0 else 0
+            avg_vol = float(v.iloc[ph_idx:tl_idx + 1].mean()) if tl_idx > ph_idx else 0
+            pullbacks.append({"peak": ph, "trough": tl, "depth": depth, "vol": avg_vol})
+            last_h = None
+
+    if len(pullbacks) < 3:
+        return None
+    pullbacks = pullbacks[-3:]   # last three pullbacks
+
+    # Each subsequent depth <= 0.7 × previous; each subsequent vol <= 1.0 × previous
+    depth_ok = all(pullbacks[i]["depth"] <= pullbacks[i - 1]["depth"] * 0.85 + 0.005
+                   for i in (1, 2))
+    vol_ok   = all(pullbacks[i]["vol"]   <= pullbacks[i - 1]["vol"]   * 1.05 + 1
+                   for i in (1, 2))
+    if not (depth_ok and vol_ok):
+        return None
+
+    last_peak  = pullbacks[-1]["peak"]
+    last_close = float(c.iloc[-1])
+    tightness  = (last_peak - last_close) / last_peak if last_peak > 0 else 0
+    if tightness > 0.10:   # current must be within 10% of latest pivot
+        return None
+
+    # Quality: 50 for any 3-stage VCP, +20 for clean depth contraction,
+    # +20 for clean volume contraction, +10 for being within 3% of pivot.
+    depth_ratio = pullbacks[-1]["depth"] / pullbacks[0]["depth"] if pullbacks[0]["depth"] > 0 else 1
+    vol_ratio   = pullbacks[-1]["vol"]   / pullbacks[0]["vol"]   if pullbacks[0]["vol"]   > 0 else 1
+    quality = 50
+    quality += 20 * max(0, 1 - depth_ratio)
+    quality += 20 * max(0, 1 - vol_ratio)
+    quality += 10 if tightness < 0.03 else 0
+    return {"name": "VCP", "quality": int(round(min(quality, 100))),
+            "key_levels": {"pivot": round(last_peak, 2),
+                           "tightness_pct": round(tightness * 100, 2),
+                           "stages": len(pullbacks)}}
+
+
+def detect_flat_base(close: pd.Series, lookback: int = 25) -> dict | None:
+    """Flat Base: close held within +/-15% range for `lookback` bars,
+    current price in the upper third of the range."""
+    if close is None or len(close) < lookback:
+        return None
+    c = close.iloc[-lookback:]
+    hi, lo, last = float(c.max()), float(c.min()), float(c.iloc[-1])
+    if hi <= 0:
+        return None
+    rng = (hi - lo) / hi
+    if rng > 0.15:
+        return None
+    upper_pos = (last - lo) / (hi - lo) if hi > lo else 1.0
+    if upper_pos < 0.66:
+        return None
+    # Quality from tightness (smaller range = better) and duration bonus
+    quality = 50 + 30 * (1 - rng / 0.15) + 20 * min(lookback / 50.0, 1.0)
+    return {"name": "Flat Base", "quality": int(round(min(quality, 100))),
+            "key_levels": {"pivot": round(hi, 2),
+                           "range_pct": round(rng * 100, 2),
+                           "duration_bars": lookback}}
+
+
+def detect_cup_handle(close: pd.Series, lookback: int = 130) -> dict | None:
+    """Cup-and-Handle: U-shape (12-33% depth) with right peak within 5% of
+    left peak, followed by a 5-15 bar handle in the upper half of the cup."""
+    if close is None or len(close) < lookback:
+        return None
+    c = close.iloc[-lookback:]
+    n = len(c)
+    left_peak_pos = int(np.argmax(c.iloc[:n // 3].values))
+    left_peak = float(c.iloc[left_peak_pos])
+
+    # Find cup bottom in middle third
+    mid_start, mid_end = n // 3, (2 * n) // 3
+    if mid_start >= mid_end:
+        return None
+    bot_pos = mid_start + int(np.argmin(c.iloc[mid_start:mid_end].values))
+    cup_bot = float(c.iloc[bot_pos])
+    if left_peak <= 0:
+        return None
+    depth = (left_peak - cup_bot) / left_peak
+    if not (0.12 <= depth <= 0.33):
+        return None
+
+    # Right peak in last third
+    right_peak_pos = (2 * n) // 3 + int(np.argmax(c.iloc[(2 * n) // 3:].values))
+    right_peak = float(c.iloc[right_peak_pos])
+    if abs(right_peak - left_peak) / left_peak > 0.05:
+        return None
+
+    # Handle: last 5-15 bars in upper half of cup, shallow pullback
+    tail = c.iloc[-15:]
+    handle_low  = float(tail.min())
+    handle_high = float(tail.max())
+    handle_depth = (handle_high - handle_low) / handle_high if handle_high > 0 else 1
+    if handle_depth > 0.12:
+        return None
+    if handle_low < cup_bot + (left_peak - cup_bot) * 0.5:
+        return None  # handle dipped into the lower half of the cup
+
+    # Quality
+    symmetry = 1 - abs(right_peak - left_peak) / left_peak
+    quality = 40 + 25 * symmetry + 20 * (1 - handle_depth / 0.12) + 15 * (depth / 0.33)
+    return {"name": "Cup & Handle", "quality": int(round(min(quality, 100))),
+            "key_levels": {"pivot": round(max(left_peak, right_peak), 2),
+                           "depth_pct": round(depth * 100, 2),
+                           "handle_depth_pct": round(handle_depth * 100, 2)}}
+
+
+def detect_base_pattern(close: pd.Series, volume: pd.Series) -> dict | None:
+    """Try Cup & Handle -> VCP -> Flat Base, return the first match with
+    quality >= 50. Returns None if no clean base is detected."""
+    for detector in (detect_cup_handle, detect_vcp, detect_flat_base):
+        try:
+            if detector is detect_vcp:
+                result = detector(close, volume)
+            elif detector is detect_cup_handle:
+                result = detector(close)
+            else:
+                result = detector(close)
+            if result and result.get("quality", 0) >= 50:
+                return result
+        except Exception:
+            continue
+    return None
+
+
 def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None = None) -> pd.DataFrame:
     results = []
     failed  = []
@@ -1146,6 +1526,7 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                     continue
 
                 signal = "Breakout" if is_breakout else ("Building" if is_vol_surge else stage_lbl)
+                pat = detect_base_pattern(close, df["Volume"]) or {}
 
                 results.append({
                     "Ticker"       : ticker.replace(".NS", ""),
@@ -1171,6 +1552,10 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                     "Upside %"     : upside["upside_pct"],
                     "52W High ₹"   : upside["high52"],
                     "Gap to 52W %" : upside["high52_gap_pct"],
+                    "Pattern"      : pat.get("name"),
+                    "Pattern Q"    : pat.get("quality"),
+                    "New 52W High" : bool(upside.get("high52_gap_pct") is not None
+                                          and abs(upside["high52_gap_pct"]) < 0.5),
                 })
             except Exception as e:
                 failed.append((ticker, str(e)))
@@ -1301,6 +1686,11 @@ def compute_single_stock_technicals(symbol_yf: str, _nifty_hash: int = 0) -> dic
         "52W High ₹"   : upside["high52"],
         "Gap to 52W %" : upside["high52_gap_pct"],
     }
+    pat = detect_base_pattern(close, df["Volume"]) or {}
+    row["Pattern"]      = pat.get("name")
+    row["Pattern Q"]    = pat.get("quality")
+    row["New 52W High"] = bool(upside.get("high52_gap_pct") is not None
+                               and abs(upside["high52_gap_pct"]) < 0.5)
     # Single-row score via the same composite engine (with std fallback).
     scored = compute_composite_score(pd.DataFrame([row]))
     row["Score"] = float(scored.iloc[0]["Score"]) if not scored.empty else np.nan
@@ -1350,6 +1740,50 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
     )
     d["Score"] = score.round(1)
     return d
+
+def attach_rs_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Minervini-style cross-sectional RS_Rank (0-99) based on the
+    `RS vs Nifty` column. No-op when the column is missing or empty."""
+    if df.empty or "RS vs Nifty" not in df.columns:
+        return df
+    d = df.copy()
+    pct = d["RS vs Nifty"].rank(pct=True, na_option="bottom")
+    d["RS_Rank"] = (pct * 100).round(0).astype("Int64").fillna(50).astype(int)
+    return d
+
+
+def attach_grade(df: pd.DataFrame, regime_label: str = "SELECTIVE",
+                 top_sectors: set | None = None) -> pd.DataFrame:
+    """Compute Conviction Grade A+/A/B+/B/C using composite Score, RS_Rank,
+    sector position, pattern quality, regime, and stage."""
+    if df.empty or "Score" not in df.columns:
+        return df
+    top_sectors = top_sectors or set()
+    regime_w  = {"AGGRESSIVE": 1.0, "SELECTIVE": 0.7, "DEFENSIVE": 0.4}.get(regime_label, 0.7)
+    stage_w   = {1: 0.8, 2: 1.0, 3: 0.8, 4: 0.2, 0: 0.5}
+
+    d = df.copy()
+    score_n   = (d["Score"].fillna(0) / 100).clip(0, 1)
+    rs_n      = (d.get("RS_Rank", pd.Series([50]*len(d), index=d.index)).fillna(50) / 100).clip(0, 1)
+    sec_n     = d["Ticker"].apply(lambda t: 1.0 if SECTOR_MAP.get(t) in top_sectors else 0.3)
+    pat_n     = (d.get("Pattern Q", pd.Series([0]*len(d), index=d.index)).fillna(0) / 100).clip(0, 1)
+    reg_n     = regime_w
+    stg_n     = d.get("StageId", pd.Series([0]*len(d), index=d.index)).map(stage_w).fillna(0.5)
+
+    grade_score = 100 * (
+        0.35 * score_n + 0.20 * rs_n + 0.15 * sec_n
+        + 0.10 * pat_n + 0.10 * reg_n + 0.10 * stg_n
+    )
+    d["GradeScore"] = grade_score.round(1)
+    def _g(s):
+        if s >= 85: return "A+"
+        if s >= 75: return "A"
+        if s >= 65: return "B+"
+        if s >= 50: return "B"
+        return "C"
+    d["Grade"] = d["GradeScore"].apply(_g)
+    return d
+
 
 def build_shortlist(df: pd.DataFrame) -> pd.DataFrame:
     """Top N rows above score threshold, with a floor."""
@@ -1668,12 +2102,27 @@ def _coalesce(v, default):
     except Exception:
         return default
 
+def _recommend_action_safe_stub(reason: str = "unknown error") -> dict:
+    return {"action": "HOLD", "conviction": 0,
+            "scores": {"technical": 0, "quality": 0, "value": 0, "growth": 0},
+            "bull_case": [f"Recommender unavailable: {reason}"],
+            "bear_case": ["Insufficient data to score"],
+            "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+
 def recommend_action(metrics: dict, tech: dict) -> dict:
     """
     metrics = fundamentals dict from fetch_fundamentals.
     tech    = single-stock row from the momentum scan (Score, Stage, ATR %, RSI, ADX, RS, Upside %, etc.).
     Returns {action, conviction, bull_case, bear_case, entry_zone, stop_loss, targets}.
+    Wrapped in a top-level try/except so an unexpected per-stock edge case
+    can never blank out the Deep Dive card — we degrade to the HOLD stub.
     """
+    try:
+        return _recommend_action_impl(metrics, tech)
+    except Exception as e:
+        return _recommend_action_safe_stub(str(e))
+
+def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
     price = _coalesce(tech.get("Price ₹"), _coalesce(metrics.get("price"), 0))
     atrp  = _coalesce(tech.get("ATR %"), 3.0)
     try:
@@ -1727,34 +2176,72 @@ def recommend_action(metrics: dict, tech: dict) -> dict:
         v = _coalesce(v, None)
         return v is not None and v < thr
 
-    # Bull / bear flags
-    bull = []
-    if _gt(metrics.get("roe"), 0.18):                    bull.append(f"ROE {metrics['roe']*100:.1f}% > 18%")
-    if _gt(metrics.get("op_margin"), 0.15):              bull.append(f"Operating margin {metrics['op_margin']*100:.1f}% > 15%")
-    if _gt(metrics.get("rev_cagr_3y"), 0.15):            bull.append(f"Revenue 3Y CAGR {metrics['rev_cagr_3y']*100:.1f}%")
-    if _gt(dcf_up, 20):                                  bull.append(f"DCF upside {dcf_up:.1f}%")
-    if stage_id in (1, 2):                               bull.append(f"Stage {stage_id} setup ({STAGE_LABELS[stage_id]})")
-    if _gt(tech.get("RS vs Nifty"), 1.1):                bull.append(f"RS vs Nifty {tech['RS vs Nifty']:.2f}")
-    if _gt(metrics.get("institutional_held"), 0.40):     bull.append(f"Institutional hold {metrics['institutional_held']*100:.0f}%")
-    if _gt(tech.get("ADX"), 25):                         bull.append(f"ADX {tech['ADX']:.0f} (trending)")
-    if _gt(metrics.get("earnings_surprise_avg"), 5):     bull.append(f"Avg earnings surprise +{metrics['earnings_surprise_avg']:.1f}%")
+    def _flag(cond_fn, fmt_fn):
+        """Run cond_fn and fmt_fn defensively. Any exception drops the bullet
+        silently — never crashes the whole recommendation. Returns the
+        formatted string or None."""
+        try:
+            if cond_fn():
+                return fmt_fn()
+        except Exception:
+            pass
+        return None
 
-    bear = []
-    if _gt(metrics.get("debt_to_equity"), 1.5):          bear.append(f"D/E {metrics['debt_to_equity']:.2f} > 1.5")
-    if _lt(metrics.get("interest_coverage"), 3):         bear.append(f"Interest cover {metrics['interest_coverage']:.1f}× weak")
-    if _gt(pe, 50) and _gt(peg, 2):                      bear.append(f"Expensive: P/E {pe:.0f}, PEG {peg:.1f}")
-    if stage_id == 4:                                    bear.append("Stage 4 — extended / climax risk")
-    if _lt(metrics.get("rev_cagr_3y"), 0):               bear.append(f"Revenue declining ({metrics['rev_cagr_3y']*100:.1f}% 3Y CAGR)")
-    if _lt(metrics.get("op_margin"), 0.05):              bear.append("Operating margin < 5%")
-    if _lt(dcf_up, -20):                                 bear.append(f"DCF says overvalued ({dcf_up:.0f}%)")
+    # Bull / bear flags — every append wrapped so a single bad value
+    # silently drops just that bullet rather than killing the recommender.
+    bull_candidates = [
+        _flag(lambda: _gt(metrics.get("roe"), 0.18),
+              lambda: f"ROE {metrics['roe']*100:.1f}% > 18%"),
+        _flag(lambda: _gt(metrics.get("op_margin"), 0.15),
+              lambda: f"Operating margin {metrics['op_margin']*100:.1f}% > 15%"),
+        _flag(lambda: _gt(metrics.get("rev_cagr_3y"), 0.15),
+              lambda: f"Revenue 3Y CAGR {metrics['rev_cagr_3y']*100:.1f}%"),
+        _flag(lambda: _gt(dcf_up, 20),
+              lambda: f"DCF upside {dcf_up:.1f}%"),
+        _flag(lambda: stage_id in (1, 2),
+              lambda: f"Stage {stage_id} setup ({STAGE_LABELS[stage_id]})"),
+        _flag(lambda: _gt(tech.get("RS_Rank"), 90),
+              lambda: f"RS Rank {int(tech['RS_Rank'])} (top decile)"),
+        _flag(lambda: _gt(tech.get("RS vs Nifty"), 1.1),
+              lambda: f"RS vs Nifty {tech['RS vs Nifty']:.2f}"),
+        _flag(lambda: _gt(metrics.get("institutional_held"), 0.40),
+              lambda: f"Institutional hold {metrics['institutional_held']*100:.0f}%"),
+        _flag(lambda: _gt(tech.get("ADX"), 25),
+              lambda: f"ADX {tech['ADX']:.0f} (trending)"),
+        _flag(lambda: _gt(metrics.get("earnings_surprise_avg"), 5),
+              lambda: f"Avg earnings surprise +{metrics['earnings_surprise_avg']:.1f}%"),
+    ]
+    bull = [b for b in bull_candidates if b]
+
+    bear_candidates = [
+        _flag(lambda: _gt(metrics.get("debt_to_equity"), 1.5),
+              lambda: f"D/E {metrics['debt_to_equity']:.2f} > 1.5"),
+        _flag(lambda: _lt(metrics.get("interest_coverage"), 3),
+              lambda: f"Interest cover {metrics['interest_coverage']:.1f}× weak"),
+        _flag(lambda: _gt(pe, 50) and _gt(peg, 2),
+              lambda: f"Expensive: P/E {pe:.0f}, PEG {peg:.1f}"),
+        _flag(lambda: stage_id == 4,
+              lambda: "Stage 4 — extended / climax risk"),
+        _flag(lambda: _lt(metrics.get("rev_cagr_3y"), 0),
+              lambda: f"Revenue declining ({metrics['rev_cagr_3y']*100:.1f}% 3Y CAGR)"),
+        _flag(lambda: _lt(metrics.get("op_margin"), 0.05),
+              lambda: "Operating margin < 5%"),
+        _flag(lambda: _lt(dcf_up, -20),
+              lambda: f"DCF says overvalued ({dcf_up:.0f}%)"),
+    ]
+    bear = [b for b in bear_candidates if b]
 
     bull_case = bull[:3] if bull else ["No standout positives"]
     bear_case = bear[:3] if bear else ["No critical red flags"]
 
-    critical_bear = any(b in bear for b in [
-        f"D/E {metrics.get('debt_to_equity', 0):.2f} > 1.5",
-        "Stage 4 — extended / climax risk",
-    ])
+    # Value-based critical-bear check — no f-string construction so a None
+    # value can never crash the recommender. (Was the line that caused the
+    # "unsupported format string passed to NoneType.__format__" runtime crash.)
+    de_val = _coalesce(metrics.get("debt_to_equity"), None)
+    critical_bear = (
+        (isinstance(de_val, (int, float)) and de_val > 1.5)
+        or stage_id == 4
+    )
 
     if stage_id == 4:
         action = "AVOID"
@@ -1777,13 +2264,18 @@ def recommend_action(metrics: dict, tech: dict) -> dict:
     stop       = round(price_v * (1 - 2 * atrp_use / 100), 2) if price_v else None
 
     targets = {}
-    if tech.get("Target ₹"):
-        targets["fib"] = float(tech["Target ₹"])
-    if metrics.get("target_mean"):
-        targets["analyst_mean"] = float(metrics["target_mean"])
-    dcf_intrinsic = (metrics.get("dcf") or {}).get("intrinsic_per_share")
-    if dcf_intrinsic:
-        targets["dcf"] = float(dcf_intrinsic)
+    def _add_target(name, v):
+        try:
+            v = float(v)
+            if np.isfinite(v) and price_v and 0.5 * price_v < v < 5 * price_v:
+                targets[name] = round(v, 2)
+        except Exception:
+            pass
+    # Renamed "fib" -> "technical" (it's the min of high52/atr/fib from
+    # estimate_upside, not pure Fibonacci).
+    _add_target("technical",    tech.get("Target ₹"))
+    _add_target("analyst_mean", metrics.get("target_mean"))
+    _add_target("dcf",          (metrics.get("dcf") or {}).get("intrinsic_per_share"))
 
     return {
         "action": action,
@@ -2236,6 +2728,20 @@ def _run_pipeline(cb=None) -> dict:
     eq_symbols = registry["YF_SYMBOL"].tolist()
     momentum_df = scan_market(eq_symbols, progress_cb=cb, nifty_close=nifty_close)
 
+    # Z3: cross-sectional RS percentile rank computed across this scan.
+    momentum_df = attach_rs_rank(momentum_df)
+
+    # Z1: market regime + Z2: sector leadership — computed once per pipeline.
+    _step("regime", 55, 100, "Computing market regime + sector leadership")
+    regime         = compute_market_regime(nifty_close, momentum_df)
+    sector_strength = compute_sector_strength(momentum_df)
+    top5_sectors    = top_sectors_set(sector_strength, top_n=5)
+
+    # Z5: assign A+/A/B+/B/C grade now that all inputs exist.
+    momentum_df = attach_grade(momentum_df,
+                               regime_label=regime.get("label", "SELECTIVE"),
+                               top_sectors=top5_sectors)
+
     shortlist_df   = build_shortlist(momentum_df)
     early_rally_df = (
         momentum_df[momentum_df["StageId"].isin([1, 2])].sort_values("Score", ascending=False)
@@ -2274,15 +2780,17 @@ def _run_pipeline(cb=None) -> dict:
             fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
 
     return {
-        "momentum_df":    momentum_df,
-        "shortlist_df":   shortlist_df,
-        "early_rally_df": early_rally_df,
-        "sector_df":      sector_df,
-        "etf_df":         etf_df,
-        "fund_map":       fund_map,
-        "intel_summary":  intel_summary,
-        "strategy":       strategy,
-        "last_run":       now_ist(),
+        "momentum_df":     momentum_df,
+        "shortlist_df":    shortlist_df,
+        "early_rally_df":  early_rally_df,
+        "sector_df":       sector_df,
+        "sector_strength": sector_strength,
+        "regime":          regime,
+        "etf_df":          etf_df,
+        "fund_map":        fund_map,
+        "intel_summary":   intel_summary,
+        "strategy":        strategy,
+        "last_run":        now_ist(),
     }
 
 # =============================
@@ -2558,6 +3066,8 @@ if "strategy" in st.session_state:
     shortlist_df   = st.session_state.get("shortlist_df", pd.DataFrame())
     early_rally_df = st.session_state.get("early_rally_df", pd.DataFrame())
     sector_df_st   = st.session_state.get("sector_df", pd.DataFrame())
+    sector_strength= st.session_state.get("sector_strength", pd.DataFrame())
+    regime         = st.session_state.get("regime", {}) or {}
     fund_map       = st.session_state.get("fund_map", {})
     intel_summary  = st.session_state.get("intel_summary", "")
     strategy       = st.session_state["strategy"]
@@ -2569,15 +3079,40 @@ if "strategy" in st.session_state:
         breakouts = int((momentum_df["StageId"] == 3).sum())
         early     = int(momentum_df["StageId"].isin([1, 2]).sum())
         avg_score = float(momentum_df["Score"].mean())
-        k1.metric("Signals",          f"{len(momentum_df)}")
-        k2.metric("Early Rally",      f"{early}", f"+{int((momentum_df['StageId']==2).sum())} stage 2")
-        k3.metric("Breakouts",        f"{breakouts}")
-        k4.metric("Avg Composite",    f"{avg_score:.1f}")
-        k5.metric("Best Upside",      f"{momentum_df['Upside %'].max():.1f}%")
+        a_plus    = int((momentum_df.get("Grade", pd.Series(dtype=str)) == "A+").sum())
+        k1.metric("Signals",       f"{len(momentum_df)}")
+        k2.metric("Early Rally",   f"{early}", f"+{int((momentum_df['StageId']==2).sum())} stage 2")
+        k3.metric("Breakouts",     f"{breakouts}")
+        k4.metric("A+ Picks",      f"{a_plus}")
+        k5.metric("Best Upside",   f"{momentum_df['Upside %'].max():.1f}%")
+
+    # ── Market Regime Banner (Z1) ──
+    if regime:
+        label = regime.get("label", "—")
+        color = {"AGGRESSIVE":"#00c896","SELECTIVE":"#d4a843","DEFENSIVE":"#f87171"}.get(label, "#8896b3")
+        mult  = regime.get("multiplier", 1.0)
+        n50   = "✓" if regime.get("nifty_above_50dma")  else "✗"
+        n200  = "✓" if regime.get("nifty_above_200dma") else "✗"
+        vix_v = regime.get("vix_level"); vix_b = regime.get("vix_band", "—")
+        vix_s = f"{vix_v:.1f}" if (vix_v is not None and np.isfinite(vix_v)) else "—"
+        b50   = regime.get("breadth_above_ma50_pct", 0.0)
+        b200  = regime.get("breadth_above_ma200_pct", 0.0)
+        st.markdown(
+            f"<div style='margin-top:14px;padding:12px 18px;border:1px solid rgba(212,168,67,0.25);"
+            f"border-left:3px solid {color};border-radius:0 12px 12px 0;background:rgba(15,20,40,0.7);"
+            f"font-family:JetBrains Mono,monospace;font-size:0.78rem;color:#c0e8d8'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px'>"
+            f"<span><strong style='color:{color};font-size:0.95rem'>MARKET REGIME · {label}</strong>"
+            f"&nbsp; (score {regime.get('score','—')}, multiplier ×{mult:.2f})</span>"
+            f"<span style='color:#8896b3'>Nifty &gt; 50DMA {n50} &nbsp; &gt; 200DMA {n200} &nbsp; "
+            f"VIX {vix_s} ({vix_b}) &nbsp; Breadth &gt;50DMA {b50:.0f}% &nbsp; &gt;200DMA {b200:.0f}%</span>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
 
     tab_scan, tab_early, tab_deep, tab_search, tab_sector, tab_intel, tab_dl = st.tabs([
         "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock",
-        "Sector Heatmap", "Intel & Strategy", "Downloads",
+        "Sector Leadership", "Intel & Strategy", "Downloads",
     ])
 
     # =======================================================
@@ -2621,9 +3156,10 @@ if "strategy" in st.session_state:
                 return "color:#f87171;font-weight:700" if val and val > RSI_OVERBOUGHT else ""
 
             display_cols = [c for c in [
-                "Ticker","Price ₹","Stage","Score","Signal","RSI","Vol Ratio",
-                "ADX","MACD Hist","RS vs Nifty","ROC20 %","MA50","MA200",
-                "Dist MA50 %","Dist MA200 %","Target ₹","Upside %","52W High ₹","Gap to 52W %",
+                "Ticker","Price ₹","Grade","Stage","Score","RS_Rank","Pattern","Pattern Q",
+                "Signal","RSI","Vol Ratio","ADX","MACD Hist","RS vs Nifty","ROC20 %",
+                "MA50","MA200","Dist MA50 %","Dist MA200 %","Target ₹","Upside %",
+                "52W High ₹","Gap to 52W %","New 52W High",
             ] if c in momentum_df.columns]
 
             fmt = {
@@ -2632,17 +3168,37 @@ if "strategy" in st.session_state:
                 "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%","ADX":"{:.1f}",
                 "MACD Hist":"{:.3f}","RS vs Nifty":"{:.2f}","ROC20 %":"{:+.1f}%",
                 "Dist MA50 %":"{:+.1f}%","Dist MA200 %":"{:+.1f}%","Score":"{:.1f}",
+                "RS_Rank":"{:.0f}","Pattern Q":"{:.0f}",
             }
             fmt = {k: v for k, v in fmt.items() if k in display_cols}
+
+            def color_grade(val):
+                colors = {"A+":"#00c896","A":"#00c896","B+":"#d4a843",
+                          "B":"#8896b3","C":"#f87171"}
+                c = colors.get(val, "")
+                return f"color:{c};font-weight:700" if c else ""
+            def color_pattern(val):
+                return "color:#4f8ef7;font-weight:700" if isinstance(val, str) and val else ""
+            def color_rs_rank(val):
+                try: v = float(val)
+                except Exception: return ""
+                if v >= 90: return "color:#00c896;font-weight:700"
+                if v >= 70: return "color:#d4a843"
+                return ""
 
             styler = momentum_df[display_cols].style.format(fmt, na_rep="N/A")
             if "Stage"    in display_cols: styler = styler.map(color_stage,      subset=["Stage"])
             if "Score"    in display_cols: styler = styler.map(color_score,      subset=["Score"])
             if "Upside %" in display_cols: styler = styler.map(color_upside,     subset=["Upside %"])
             if "RSI"      in display_cols: styler = styler.map(color_rsi_stock,  subset=["RSI"])
+            if "Grade"    in display_cols: styler = styler.map(color_grade,      subset=["Grade"])
+            if "Pattern"  in display_cols: styler = styler.map(color_pattern,    subset=["Pattern"])
+            if "RS_Rank"  in display_cols: styler = styler.map(color_rs_rank,    subset=["RS_Rank"])
 
             st.dataframe(styler, use_container_width=True, height=520)
-            st.caption(f"All {len(momentum_df)} signals · ranked by composite Score. Stage 4 rows are kept but down-weighted.")
+            st.caption(f"All {len(momentum_df)} signals · ranked by composite Score. "
+                       f"Grade blends Score, RS_Rank, sector position, pattern quality, regime, and stage. "
+                       f"Stage 4 rows are kept but down-weighted.")
         else:
             st.info("No momentum candidates found in this scan.")
 
@@ -2762,9 +3318,36 @@ if "strategy" in st.session_state:
     # TAB 4 — SECTOR HEATMAP
     # =======================================================
     with tab_sector:
-        st.markdown('<div class="section-header">Sector Heatmap</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Sector Leadership · NSE Sector Indices</div>', unsafe_allow_html=True)
+        st.caption("Ranked by composite of 3M / 1M return + above-DMA + in-scan breadth. Top 5 sectors ('In play') give every stock in them a Grade boost.")
+
+        if sector_strength is not None and not sector_strength.empty:
+            def color_status(val):
+                return ("color:#00c896;font-weight:700" if val == "In play"
+                        else ("color:#d4a843" if val == "Watch"
+                              else "color:#f87171" if val == "Laggard" else ""))
+            def color_ret(val):
+                try: v = float(val)
+                except Exception: return ""
+                if v >= 10: return "color:#00c896;font-weight:700"
+                if v >= 3:  return "color:#d4a843"
+                if v <= -5: return "color:#f87171;font-weight:700"
+                return ""
+            ss_styler = sector_strength.style.format({
+                "1M %":"{:+.1f}%","3M %":"{:+.1f}%","6M %":"{:+.1f}%","Score":"{:.1f}",
+            }, na_rep="—")
+            for c in ("1M %", "3M %", "6M %"):
+                if c in sector_strength.columns:
+                    ss_styler = ss_styler.map(color_ret, subset=[c])
+            if "Status" in sector_strength.columns:
+                ss_styler = ss_styler.map(color_status, subset=["Status"])
+            st.dataframe(ss_styler, use_container_width=True, height=400)
+        else:
+            st.info("Sector index data unavailable — check yfinance access.")
+
+        st.markdown('<div class="section-header" style="margin-top:30px">In-Scan Sector Breakdown</div>', unsafe_allow_html=True)
         if sector_df_st is None or sector_df_st.empty:
-            st.info("No mapped-sector data available from this scan.")
+            st.info("No mapped-sector breakdown from this scan.")
         else:
             def color_avg_up(val):
                 if val is None or not np.isfinite(val): return ""
@@ -2775,7 +3358,7 @@ if "strategy" in st.session_state:
                 sector_df_st.style
                     .map(color_avg_up, subset=["Avg Upside %"])
                     .format({"Avg Upside %": "+{:.1f}%"}),
-                use_container_width=True, height=460,
+                use_container_width=True, height=360,
             )
 
     # =======================================================
