@@ -1041,8 +1041,10 @@ def build_etf_context(etf_df: pd.DataFrame) -> str:
 # MOMENTUM SCANNER
 # =============================
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_nifty_close(period: str = "1y") -> pd.Series:
-    """Fetch ^NSEI close series once per scan for RS calculations."""
+    """Fetch ^NSEI close series. Cached 1h so the ad-hoc Search Stock tab
+    doesn't refetch the index on every lookup."""
     try:
         hist = _yf_ticker("^NSEI").history(period=period, interval="1d", auto_adjust=True)
         if hist.empty:
@@ -1184,6 +1186,128 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
 
 
 # =============================
+# SINGLE-STOCK TECHNICALS (used by the ad-hoc Search Stock tab)
+# Mirrors scan_market's per-ticker work but for one symbol on demand,
+# without any stage/breakout filter — every symbol gets a row.
+# =============================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_single_stock_technicals(symbol_yf: str, _nifty_hash: int = 0) -> dict | None:
+    """One-stock equivalent of scan_market's per-row work. Returns a dict
+    matching the scan_market row schema (including Score), or None if the
+    data is too thin to be useful. `_nifty_hash` is just a cache key
+    discriminator that changes with the cached Nifty series."""
+    try:
+        data = _yf_download(
+            [symbol_yf], period="1y", interval="1d",
+            group_by="ticker", threads=False, progress=False, auto_adjust=True,
+        )
+        if data is None or data.empty:
+            return None
+        # yfinance returns either a flat DataFrame (single ticker) or a
+        # MultiIndex one; normalise to flat columns.
+        if isinstance(data.columns, pd.MultiIndex):
+            try:
+                data = data[symbol_yf]
+            except KeyError:
+                data.columns = data.columns.get_level_values(0)
+        df = data.dropna(subset=["Close", "Volume"])
+        if len(df) < MIN_BARS:
+            return None
+    except Exception:
+        return None
+
+    nifty_close = get_nifty_close()
+
+    close        = df["Close"]
+    price        = float(close.iloc[-1])
+    ma50         = compute_ma(close, MA_PERIOD)
+    ma200        = compute_ma(close, MA_LONG_PERIOD)
+    ma50_series  = close.rolling(MA_PERIOD).mean()
+    ma200_series = close.rolling(MA_LONG_PERIOD).mean()
+    ma50_slope10  = slope_pct(ma50_series.dropna(),  window=10)  if ma50_series.notna().sum()  >= 11 else np.nan
+    ma200_slope20 = slope_pct(ma200_series.dropna(), window=20)  if ma200_series.notna().sum() >= 21 else np.nan
+
+    high20    = float(df["High"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
+    vol_avg   = float(df["Volume"].iloc[-(VOL_LOOKBACK + 1):-1].mean())
+    vol_now   = float(df["Volume"].iloc[-1])
+    vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
+    rsi       = compute_rsi(close)
+    atr_pct   = compute_atr_pct(df)
+    upside    = estimate_upside(df, price, high20)
+
+    macd_last, sig_last, hist_last, hist_series = compute_macd(close)
+    macd_above_signal = bool(np.isfinite(macd_last) and np.isfinite(sig_last) and macd_last > sig_last)
+    macd_cross_recent = False
+    if len(hist_series.dropna()) >= 11:
+        tail = hist_series.dropna().iloc[-11:]
+        macd_cross_recent = bool(((tail.shift(1) < 0) & (tail > 0)).any())
+
+    adx_series = compute_adx_series(df)
+    if len(adx_series.dropna()) >= 6:
+        adx_now  = _safe_last(adx_series)
+        adx_prev = float(adx_series.dropna().iloc[-6])
+    else:
+        adx_now, adx_prev = np.nan, np.nan
+    _, plus_di, minus_di = compute_adx(df)
+
+    roc20      = compute_roc(close, 20)
+    obv_slope  = compute_obv_slope(close, df["Volume"])
+    rs_nifty   = compute_rs_vs_nifty(close, nifty_close) if nifty_close is not None and not nifty_close.empty else np.nan
+    bb_squeeze = is_bb_squeeze(close)
+    d_ma50     = dist_from_ma(price, ma50)
+    d_ma200    = dist_from_ma(price, ma200)
+
+    is_breakout  = price >= high20 * BREAKOUT_TOLERANCE
+    is_vol_surge = vol_ratio > VOL_SURGE_THRESH
+
+    classify_input = {
+        "price": price, "ma50": ma50, "ma200": ma200,
+        "ma50_slope10": ma50_slope10, "ma200_slope20": ma200_slope20,
+        "rsi": rsi, "adx": adx_now, "adx_prev": adx_prev,
+        "macd_hist": hist_last, "macd_above_signal": macd_above_signal,
+        "macd_cross_recent": macd_cross_recent,
+        "obv_slope": obv_slope, "rs_nifty": rs_nifty,
+        "vol_ratio": vol_ratio, "high20": high20,
+        "bb_squeeze": bb_squeeze,
+        "dist_ma200": d_ma200, "dist_ma50": d_ma50,
+        "is_breakout": is_breakout,
+    }
+    stage_id, stage_lbl = classify_stage(classify_input)
+    signal = "Breakout" if is_breakout else ("Building" if is_vol_surge else stage_lbl)
+
+    row = {
+        "Ticker"       : symbol_yf.replace(".NS", ""),
+        "Price ₹"      : round(price, 2),
+        "MA50"         : round(ma50, 2) if np.isfinite(ma50) else np.nan,
+        "MA200"        : round(ma200, 2) if np.isfinite(ma200) else np.nan,
+        "RSI"          : rsi,
+        "Vol Ratio"    : round(vol_ratio, 2),
+        "Signal"       : signal,
+        "Stage"        : stage_lbl,
+        "StageId"      : stage_id,
+        "ADX"          : round(adx_now, 1) if np.isfinite(adx_now) else np.nan,
+        "+DI"          : round(plus_di, 1) if np.isfinite(plus_di) else np.nan,
+        "-DI"          : round(minus_di, 1) if np.isfinite(minus_di) else np.nan,
+        "MACD Hist"    : round(hist_last, 3) if np.isfinite(hist_last) else np.nan,
+        "ROC20 %"      : roc20,
+        "OBV Slope"    : obv_slope,
+        "RS vs Nifty"  : rs_nifty,
+        "Dist MA50 %"  : d_ma50,
+        "Dist MA200 %" : d_ma200,
+        "ATR %"        : atr_pct,
+        "Target ₹"     : upside["target"],
+        "Upside %"     : upside["upside_pct"],
+        "52W High ₹"   : upside["high52"],
+        "Gap to 52W %" : upside["high52_gap_pct"],
+    }
+    # Single-row score via the same composite engine (with std fallback).
+    scored = compute_composite_score(pd.DataFrame([row]))
+    row["Score"] = float(scored.iloc[0]["Score"]) if not scored.empty else np.nan
+    return row
+
+
+# =============================
 # COMPOSITE SCORING
 # =============================
 
@@ -1205,7 +1329,11 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
     vol_w    = (d["Vol Ratio"].fillna(0) / 3.0).clip(0, 1)
     rsi_w    = d["RSI"].apply(_rsi_health)
     hist     = d["MACD Hist"].fillna(0.0)
-    hist_std = hist.std() if hist.std() and hist.std() > 0 else 1.0
+    # std() returns NaN for a 1-row frame and 0 if all rows are equal — both
+    # would break the score. Fall back to 1.0 so a single-row scoring
+    # (Search Stock tab) gets a meaningful value.
+    raw_std  = hist.std()
+    hist_std = raw_std if (pd.notna(raw_std) and raw_std > 0) else 1.0
     macd_w   = (hist / hist_std).clip(lower=0, upper=1)
     adx_w    = ((d["ADX"].fillna(0) - 15).clip(lower=0) / 25).clip(upper=1)
     rs_w     = ((d["RS vs Nifty"].fillna(1.0) - 1.0) * 5).clip(0, 1)
@@ -2242,6 +2370,186 @@ elif (_read_status() or {}).get("error"):
     st.error(f"Last background job failed: {err}")
 
 # =============================
+# DEEP DIVE PANEL — shared by the shortlist selectbox and the Search Stock tab
+# =============================
+
+def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict,
+                           context_label: str = "",
+                           intel_summary: str = "") -> None:
+    """Render the full per-stock deep dive UI. Used by both the shortlist
+    selectbox path (Deep Dive tab) and the ad-hoc Search Stock tab."""
+    m = metrics or {}
+
+    # Header strip
+    hcol1, hcol2, hcol3, hcol4 = st.columns([2, 1, 1, 1])
+    sub_caption = m.get("name", "") or ""
+    sector_line = f"{m.get('sector') or '—'} / {m.get('industry') or '—'}"
+    meta_html = f"{sub_caption} &nbsp;·&nbsp; {sector_line}"
+    if context_label:
+        meta_html += f" &nbsp;·&nbsp; <span style='color:#d4a843'>{context_label}</span>"
+    hcol1.markdown(
+        f"<div class='ticker-name'>{ticker}</div>"
+        f"<div class='ticker-meta'>{meta_html}</div>",
+        unsafe_allow_html=True,
+    )
+    hcol2.metric("Price ₹", _num(tech_row.get("Price ₹")))
+    hcol3.metric("Stage", tech_row.get("Stage", "—"))
+    hcol4.metric("Score", _num(tech_row.get("Score"), decimals=1))
+
+    # Recommendation card
+    action = rec.get("action", "—")
+    color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
+                 "HOLD":"#8896b3","AVOID":"#f87171"}
+    ac_color = color_map.get(action, "#8896b3")
+    st.markdown(f"""
+    <div class="pick-card" style="margin-top:10px;border-left:3px solid {ac_color}">
+        <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+            <span class="upside-pill" style="background:{ac_color};color:#0a0a0a;font-size:0.95rem;padding:6px 18px">
+                {action.replace('_',' ')}
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                Conviction <strong style="color:#f0c96a;font-size:1.1rem">{rec.get('conviction','—')}</strong> / 100
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    if rec.get("conviction") is not None:
+        st.progress(min(int(rec["conviction"]), 100))
+
+    scores = rec.get("scores", {})
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Tech",    f"{scores.get('technical','—')}")
+    sc2.metric("Quality", f"{scores.get('quality','—')}")
+    sc3.metric("Value",   f"{scores.get('value','—')}")
+    sc4.metric("Growth",  f"{scores.get('growth','—')}")
+
+    # Sub-tabs for fundamentals
+    stab_v, stab_q, stab_g, stab_o, stab_th = st.tabs(
+        ["Valuation", "Quality", "Growth", "Ownership", "Bull/Bear & Targets"]
+    )
+
+    with stab_v:
+        dcf = m.get("dcf") or {}
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("P/E trailing", _num(m.get("pe_trailing")))
+        v2.metric("P/E forward",  _num(m.get("pe_forward")))
+        v3.metric("P/B",          _num(m.get("pb")))
+        v4.metric("EV/EBITDA",    _num(m.get("ev_ebitda")))
+        v5, v6, v7, v8 = st.columns(4)
+        v5.metric("PEG",          _num(m.get("peg")))
+        v6.metric("P/S",          _num(m.get("price_to_sales")))
+        v7.metric("Div Yield",    _pct(m.get("dividend_yield")))
+        v8.metric("DCF Intrinsic ₹", _num(dcf.get("intrinsic_per_share")))
+        d1, d2, d3 = st.columns(3)
+        d1.metric("DCF Upside %", _num(dcf.get("upside_pct"), suffix="%"))
+        d2.metric("DCF Confidence", dcf.get("confidence", "—"))
+        a = dcf.get("assumptions", {})
+        d3.metric("Growth used", _pct(a.get("growth")) if a else "—")
+        if a:
+            st.caption(
+                f"DCF: 5y FCF @ growth {_pct(a.get('growth'))} · discount {_pct(a.get('discount_rate'))} · "
+                f"terminal {_pct(a.get('terminal_growth'))} · history {a.get('fcf_history_years','—')}y"
+            )
+
+    with stab_q:
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("ROE",   _pct(m.get("roe")))
+        q2.metric("ROCE",  _pct(m.get("roce")))
+        q3.metric("ROIC",  _pct(m.get("roic")))
+        q4.metric("ROA",   _pct(m.get("roa")))
+        q5, q6, q7, q8 = st.columns(4)
+        q5.metric("Gross Margin", _pct(m.get("gross_margin")))
+        q6.metric("Op Margin",    _pct(m.get("op_margin")))
+        q7.metric("Net Margin",   _pct(m.get("net_margin")))
+        q8.metric("D/E",          _num(m.get("debt_to_equity")))
+        q9, q10, q11, _ = st.columns(4)
+        q9.metric("Interest Cov", _num(m.get("interest_coverage"), suffix="×"))
+        q10.metric("Current Ratio", _num(m.get("current_ratio")))
+        q11.metric("Quick Ratio",   _num(m.get("quick_ratio")))
+
+    with stab_g:
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Rev CAGR 3Y",   _pct(m.get("rev_cagr_3y")))
+        g2.metric("Rev CAGR 5Y",   _pct(m.get("rev_cagr_5y")))
+        g3.metric("EPS CAGR 3Y",   _pct(m.get("eps_cagr_3y")))
+        g4.metric("Fwd EPS Growth", _pct(m.get("fwd_eps_growth")))
+        g5, g6, g7, _ = st.columns(4)
+        g5.metric("Revenue Growth (TTM)",  _pct(m.get("revenue_growth")))
+        g6.metric("Earnings Growth (TTM)", _pct(m.get("earnings_growth")))
+        g7.metric("Avg Earnings Surprise", _num(m.get("earnings_surprise_avg"), suffix="%"))
+
+    with stab_o:
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("Insider Held",       _pct(m.get("insider_held")))
+        o2.metric("Institutional Held", _pct(m.get("institutional_held")))
+        o3.metric("Analyst Rec",        m.get("recommendation_key") or "—")
+        o4.metric("Analyst Count",      _num(m.get("analyst_count"), decimals=0))
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Analyst Target Mean ₹", _num(m.get("target_mean")))
+        t2.metric("Analyst Target High ₹", _num(m.get("target_high")))
+        t3.metric("Analyst Target Low ₹",  _num(m.get("target_low")))
+        hl = m.get("news_headlines") or []
+        if hl:
+            st.markdown("**Recent news headlines:**")
+            for h in hl:
+                st.markdown(f"- {h}")
+
+    with stab_th:
+        b1, b2 = st.columns(2)
+        with b1:
+            st.markdown("**Bull case**")
+            for b in rec.get("bull_case", []):
+                st.markdown(f"- {b}")
+        with b2:
+            st.markdown("**Bear case**")
+            for b in rec.get("bear_case", []):
+                st.markdown(f"- {b}")
+        ez = rec.get("entry_zone", (None, None))
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
+        e2.metric("Stop Loss ₹",  _num(rec.get("stop_loss")))
+        tgts = rec.get("targets", {})
+        e3.metric("Targets count", f"{len(tgts)}")
+        if tgts:
+            price_val = tech_row.get("Price ₹")
+            tdf = pd.DataFrame(
+                [(k, v, ((v / price_val - 1) * 100 if price_val else None))
+                 for k, v in tgts.items()],
+                columns=["Source", "Target ₹", "Upside %"],
+            ).sort_values("Target ₹")
+            st.dataframe(
+                tdf.style.format({"Target ₹": "₹{:.2f}", "Upside %": "{:+.1f}%"}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+        if st.button("Generate AI thesis for this stock", key=f"ai_thesis_{ticker}"):
+            sys = "NSE equity analyst. 4 sentences max. Cite numbers and macro context."
+            macro_block = ""
+            if intel_summary:
+                macro_short = condense_intel(intel_summary)[:1200]
+                if macro_short:
+                    macro_block = f"\n\nCURRENT MACRO CONTEXT:\n{macro_short}\n"
+            prompt_th = (
+                f"{ticker} ({m.get('name','')}): price ₹{tech_row.get('Price ₹')}, "
+                f"Stage {tech_row.get('Stage')}, RSI {tech_row.get('RSI')}, ADX {tech_row.get('ADX')}, "
+                f"RS {tech_row.get('RS vs Nifty')}. ROE { _pct(m.get('roe')) }, "
+                f"Op margin { _pct(m.get('op_margin')) }, P/E fwd { _num(m.get('pe_forward')) }, "
+                f"DCF upside { _num((m.get('dcf') or {}).get('upside_pct'), suffix='%') }. "
+                f"Action: {rec.get('action')}, conviction {rec.get('conviction')}."
+                f"{macro_block}\n"
+                f"Write a 4-sentence investment thesis covering: 1) technical setup, "
+                f"2) fundamentals, 3) valuation, 4) how the current macro context "
+                f"(Nifty / USD-INR / Brent / RBI / FII-DII flows) affects this name. "
+                f"Output the thesis directly. Do not reproduce planning, instructions, or deliberation."
+            )
+            with st.spinner("Drafting thesis …"):
+                thesis = call_ai(prompt_th, system=sys, max_tokens=4096)
+            if thesis:
+                st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
+            else:
+                st.warning("Thesis unavailable (AI call failed). Check Debug Log.")
+
+# =============================
 # DISPLAY RESULTS
 # =============================
 
@@ -2267,8 +2575,9 @@ if "strategy" in st.session_state:
         k4.metric("Avg Composite",    f"{avg_score:.1f}")
         k5.metric("Best Upside",      f"{momentum_df['Upside %'].max():.1f}%")
 
-    tab_scan, tab_early, tab_deep, tab_sector, tab_intel, tab_dl = st.tabs([
-        "Momentum Scan", "Early Rally", "Deep Dive", "Sector Heatmap", "Intel & Strategy", "Downloads",
+    tab_scan, tab_early, tab_deep, tab_search, tab_sector, tab_intel, tab_dl = st.tabs([
+        "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock",
+        "Sector Heatmap", "Intel & Strategy", "Downloads",
     ])
 
     # =======================================================
@@ -2385,169 +2694,69 @@ if "strategy" in st.session_state:
                 st.warning(f"Only {len(shortlist_df)} stocks passed the score threshold ({SHORTLIST_MIN_SCORE}). Showing the top {len(shortlist_df)} by score.")
             tickers = shortlist_df["Ticker"].tolist()
             selected_ticker = st.selectbox("Select a shortlisted stock", tickers, key="deepdive_ticker")
-            yf_sym = f"{selected_ticker}.NS"
+            yf_sym  = f"{selected_ticker}.NS"
             payload = fund_map.get(yf_sym, {})
-            m   = payload.get("metrics", {}) if payload else {}
-            rec = payload.get("recommendation", {}) if payload else {}
+            m       = payload.get("metrics", {}) if payload else {}
+            rec     = payload.get("recommendation", {}) if payload else {}
             tech_row = shortlist_df[shortlist_df["Ticker"] == selected_ticker].iloc[0].to_dict()
-
-            # Header strip
-            hcol1, hcol2, hcol3, hcol4 = st.columns([2, 1, 1, 1])
-            hcol1.markdown(
-                f"<div class='ticker-name'>{selected_ticker}</div>"
-                f"<div class='ticker-meta'>{m.get('name','')} &nbsp;·&nbsp; "
-                f"{m.get('sector') or '—'} / {m.get('industry') or '—'}</div>",
-                unsafe_allow_html=True,
-            )
-            hcol2.metric("Price ₹", _num(tech_row.get("Price ₹")))
-            hcol3.metric("Stage", tech_row.get("Stage", "—"))
-            hcol4.metric("Score", _num(tech_row.get("Score"), decimals=1))
-
-            # Recommendation card
-            action = rec.get("action", "—")
-            color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
-                         "HOLD":"#8896b3","AVOID":"#f87171"}
-            ac_color = color_map.get(action, "#8896b3")
-            st.markdown(f"""
-            <div class="pick-card" style="margin-top:10px;border-left:3px solid {ac_color}">
-                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
-                    <span class="upside-pill" style="background:{ac_color};color:#0a0a0a;font-size:0.95rem;padding:6px 18px">
-                        {action.replace('_',' ')}
-                    </span>
-                    <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
-                        Conviction <strong style="color:#f0c96a;font-size:1.1rem">{rec.get('conviction','—')}</strong> / 100
-                    </span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            if rec.get("conviction") is not None:
-                st.progress(min(int(rec["conviction"]), 100))
-
-            scores = rec.get("scores", {})
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Tech",    f"{scores.get('technical','—')}")
-            sc2.metric("Quality", f"{scores.get('quality','—')}")
-            sc3.metric("Value",   f"{scores.get('value','—')}")
-            sc4.metric("Growth",  f"{scores.get('growth','—')}")
-
-            # Sub-tabs for fundamentals
-            stab_v, stab_q, stab_g, stab_o, stab_th = st.tabs(
-                ["Valuation", "Quality", "Growth", "Ownership", "Bull/Bear & Targets"]
+            score_v  = tech_row.get("Score")
+            ctx_label = f"From shortlist · score {score_v:.0f}" if score_v is not None else "From shortlist"
+            render_deep_dive_panel(
+                selected_ticker, tech_row, m, rec,
+                context_label=ctx_label, intel_summary=intel_summary,
             )
 
-            with stab_v:
-                dcf = m.get("dcf") or {}
-                v1, v2, v3, v4 = st.columns(4)
-                v1.metric("P/E trailing", _num(m.get("pe_trailing")))
-                v2.metric("P/E forward",  _num(m.get("pe_forward")))
-                v3.metric("P/B",          _num(m.get("pb")))
-                v4.metric("EV/EBITDA",    _num(m.get("ev_ebitda")))
-                v5, v6, v7, v8 = st.columns(4)
-                v5.metric("PEG",          _num(m.get("peg")))
-                v6.metric("P/S",          _num(m.get("price_to_sales")))
-                v7.metric("Div Yield",    _pct(m.get("dividend_yield")))
-                v8.metric("DCF Intrinsic ₹", _num(dcf.get("intrinsic_per_share")))
-                d1, d2, d3 = st.columns(3)
-                d1.metric("DCF Upside %", _num(dcf.get("upside_pct"), suffix="%"))
-                d2.metric("DCF Confidence", dcf.get("confidence", "—"))
-                a = dcf.get("assumptions", {})
-                d3.metric("Growth used", _pct(a.get("growth")) if a else "—")
-                if a:
-                    st.caption(
-                        f"DCF: 5y FCF @ growth {_pct(a.get('growth'))} · discount {_pct(a.get('discount_rate'))} · "
-                        f"terminal {_pct(a.get('terminal_growth'))} · history {a.get('fcf_history_years','—')}y"
+    # =======================================================
+    # TAB 4 — SEARCH STOCK (ad-hoc deep dive on any NSE EQ symbol)
+    # =======================================================
+    with tab_search:
+        st.markdown('<div class="section-header">Search Any NSE Stock · Ad-hoc Deep Dive</div>', unsafe_allow_html=True)
+        st.caption("Type any NSE EQ ticker or company name. Same indicators, fundamentals, DCF, and recommendation that the shortlist uses — computed on demand and cached for 1 hour.")
+
+        registry = get_nse_registry()
+        if registry is None or registry.empty:
+            st.warning("NSE registry unavailable — try again in a moment.")
+        else:
+            reg = registry.copy()
+            name_col = next((c for c in reg.columns if "NAME" in c), None)
+            if name_col:
+                reg["label"] = reg["SYMBOL"].astype(str) + " — " + reg[name_col].astype(str).str.strip()
+            else:
+                reg["label"] = reg["SYMBOL"].astype(str)
+            labels = reg["label"].tolist()
+            label_to_symbol = dict(zip(reg["label"], reg["SYMBOL"].astype(str)))
+
+            picked_label = st.selectbox(
+                "Search any NSE EQ stock",
+                labels, index=None,
+                placeholder="Start typing ticker or company name…",
+                key="search_stock_label",
+            )
+
+            if picked_label:
+                picked_symbol = label_to_symbol.get(picked_label, "").strip().upper()
+                yf_sym = f"{picked_symbol}.NS"
+                with st.spinner(f"Computing technicals + fundamentals for {picked_symbol} …"):
+                    tech_row = compute_single_stock_technicals(yf_sym)
+                    metrics  = fetch_fundamentals(yf_sym) if tech_row is not None else {}
+                if tech_row is None:
+                    st.warning(f"No usable price data for {picked_symbol}. The symbol may be delisted, suspended, or too thinly traded.")
+                else:
+                    try:
+                        rec = recommend_action(metrics, tech_row)
+                    except Exception as e:
+                        rec = {"action": "HOLD", "conviction": 0, "scores": {},
+                               "bull_case": [f"Recommender error: {e}"], "bear_case": [],
+                               "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+                    in_shortlist = (shortlist_df is not None and not shortlist_df.empty
+                                    and picked_symbol in set(shortlist_df["Ticker"].astype(str)))
+                    ctx_label = "Ad-hoc lookup · in shortlist" if in_shortlist else "Ad-hoc lookup · not in shortlist"
+                    render_deep_dive_panel(
+                        picked_symbol, tech_row, metrics, rec,
+                        context_label=ctx_label, intel_summary=intel_summary,
                     )
-
-            with stab_q:
-                q1, q2, q3, q4 = st.columns(4)
-                q1.metric("ROE",   _pct(m.get("roe")))
-                q2.metric("ROCE",  _pct(m.get("roce")))
-                q3.metric("ROIC",  _pct(m.get("roic")))
-                q4.metric("ROA",   _pct(m.get("roa")))
-                q5, q6, q7, q8 = st.columns(4)
-                q5.metric("Gross Margin", _pct(m.get("gross_margin")))
-                q6.metric("Op Margin",    _pct(m.get("op_margin")))
-                q7.metric("Net Margin",   _pct(m.get("net_margin")))
-                q8.metric("D/E",          _num(m.get("debt_to_equity")))
-                q9, q10, q11, _ = st.columns(4)
-                q9.metric("Interest Cov", _num(m.get("interest_coverage"), suffix="×"))
-                q10.metric("Current Ratio", _num(m.get("current_ratio")))
-                q11.metric("Quick Ratio",   _num(m.get("quick_ratio")))
-
-            with stab_g:
-                g1, g2, g3, g4 = st.columns(4)
-                g1.metric("Rev CAGR 3Y",   _pct(m.get("rev_cagr_3y")))
-                g2.metric("Rev CAGR 5Y",   _pct(m.get("rev_cagr_5y")))
-                g3.metric("EPS CAGR 3Y",   _pct(m.get("eps_cagr_3y")))
-                g4.metric("Fwd EPS Growth", _pct(m.get("fwd_eps_growth")))
-                g5, g6, g7, _ = st.columns(4)
-                g5.metric("Revenue Growth (TTM)",  _pct(m.get("revenue_growth")))
-                g6.metric("Earnings Growth (TTM)", _pct(m.get("earnings_growth")))
-                g7.metric("Avg Earnings Surprise", _num(m.get("earnings_surprise_avg"), suffix="%"))
-
-            with stab_o:
-                o1, o2, o3, o4 = st.columns(4)
-                o1.metric("Insider Held",       _pct(m.get("insider_held")))
-                o2.metric("Institutional Held", _pct(m.get("institutional_held")))
-                o3.metric("Analyst Rec",        m.get("recommendation_key") or "—")
-                o4.metric("Analyst Count",      _num(m.get("analyst_count"), decimals=0))
-                t1, t2, t3 = st.columns(3)
-                t1.metric("Analyst Target Mean ₹", _num(m.get("target_mean")))
-                t2.metric("Analyst Target High ₹", _num(m.get("target_high")))
-                t3.metric("Analyst Target Low ₹",  _num(m.get("target_low")))
-                hl = m.get("news_headlines") or []
-                if hl:
-                    st.markdown("**Recent news headlines:**")
-                    for h in hl:
-                        st.markdown(f"- {h}")
-
-            with stab_th:
-                b1, b2 = st.columns(2)
-                with b1:
-                    st.markdown("**Bull case**")
-                    for b in rec.get("bull_case", []):
-                        st.markdown(f"- {b}")
-                with b2:
-                    st.markdown("**Bear case**")
-                    for b in rec.get("bear_case", []):
-                        st.markdown(f"- {b}")
-                ez = rec.get("entry_zone", (None, None))
-                e1, e2, e3 = st.columns(3)
-                e1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
-                e2.metric("Stop Loss ₹",  _num(rec.get("stop_loss")))
-                tgts = rec.get("targets", {})
-                first_tgt = next(iter(tgts.values()), None) if tgts else None
-                e3.metric("Targets count", f"{len(tgts)}")
-                if tgts:
-                    tdf = pd.DataFrame(
-                        [(k, v, ((v / tech_row.get("Price ₹") - 1) * 100 if tech_row.get("Price ₹") else None))
-                         for k, v in tgts.items()],
-                        columns=["Source", "Target ₹", "Upside %"],
-                    ).sort_values("Target ₹")
-                    st.dataframe(
-                        tdf.style.format({"Target ₹": "₹{:.2f}", "Upside %": "{:+.1f}%"}, na_rep="—"),
-                        use_container_width=True, hide_index=True,
-                    )
-
-                if st.button("Generate AI thesis for this stock", key=f"ai_thesis_{selected_ticker}"):
-                    sys = "NSE equity analyst. 4 sentences max. Cite numbers."
-                    prompt_th = (
-                        f"{selected_ticker} ({m.get('name','')}): price ₹{tech_row.get('Price ₹')}, "
-                        f"Stage {tech_row.get('Stage')}, RSI {tech_row.get('RSI')}, ADX {tech_row.get('ADX')}, "
-                        f"RS {tech_row.get('RS vs Nifty')}. ROE { _pct(m.get('roe')) }, "
-                        f"Op margin { _pct(m.get('op_margin')) }, P/E fwd { _num(m.get('pe_forward')) }, "
-                        f"DCF upside { _num((m.get('dcf') or {}).get('upside_pct'), suffix='%') }. "
-                        f"Action: {rec.get('action')}, conviction {rec.get('conviction')}. "
-                        f"Write a 4-sentence investment thesis covering: 1) setup, 2) fundamentals, "
-                        f"3) valuation, 4) primary risk. "
-                        f"Output the thesis directly. Do not reproduce planning, instructions, or deliberation."
-                    )
-                    with st.spinner("Drafting thesis …"):
-                        thesis = call_ai(prompt_th, system=sys, max_tokens=4096)
-                    if thesis:
-                        st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
-                    else:
-                        st.warning("Thesis unavailable (AI call failed). Check Debug Log.")
+            else:
+                st.info("Select a stock from the dropdown above to see its full deep dive.")
 
     # =======================================================
     # TAB 4 — SECTOR HEATMAP
