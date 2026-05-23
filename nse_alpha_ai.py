@@ -526,6 +526,21 @@ st.markdown(f"""
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
+def _extract_user_answer(reasoning: str, max_chars: int = 3000) -> str:
+    """When the model truncates before writing `content`, salvage the user-facing
+    portion from `reasoning_content`. Strategy: find the LAST markdown section
+    header (## or **bold**) and return everything from there to the end. If no
+    such anchor exists, return the trailing slice."""
+    if not reasoning:
+        return ""
+    text = _strip_think(reasoning).strip()
+    if not text:
+        return ""
+    matches = list(re.finditer(r"(?m)^\s*(?:##+\s|\*\*[^\n*]{2,}\*\*)", text))
+    if matches:
+        return text[matches[-1].start():].strip()
+    return text[-max_chars:].strip()
+
 def _record_ai_debug(entry: dict) -> None:
     """Append AI call debug data to session_state, falling back to a module
     buffer if there's no script_run_ctx (i.e. background thread)."""
@@ -536,7 +551,7 @@ def _record_ai_debug(entry: dict) -> None:
     except Exception:
         _AI_DEBUG_BUFFER.append(entry)
 
-def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
+def call_ai(prompt: str, system: str = "", max_tokens: int = 24000) -> str:
     headers  = {"Authorization": f"Bearer {SARVAM_API_KEY}", "Content-Type": "application/json"}
     messages = []
     if system:
@@ -553,15 +568,38 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
 
     try:
         r = requests.post(SARVAM_URL, headers=headers, json=payload, timeout=240)
-        _record_ai_debug({"model": "sarvam-105b", "status": r.status_code, "body": r.text[:1200]})
+        debug = {"model": "sarvam-105b", "status": r.status_code, "body": r.text[:1200]}
 
         if r.status_code == 200:
             choices = r.json().get("choices", [])
             if choices:
-                content = choices[0].get("message", {}).get("content", "")
-                stripped = _strip_think(str(content))
+                ch        = choices[0] or {}
+                msg       = ch.get("message", {}) or {}
+                content   = str(msg.get("content") or "")
+                reasoning = str(msg.get("reasoning_content") or "")
+                debug.update({
+                    "finish_reason": ch.get("finish_reason"),
+                    "content_len":   len(content),
+                    "reasoning_len": len(reasoning),
+                })
+
+                stripped = _strip_think(content)
                 if stripped:
+                    debug["fallback_used"] = False
+                    _record_ai_debug(debug)
                     return stripped
+
+                # Reasoning-content fallback: salvage the user-facing portion
+                # from the chain-of-thought when sarvam-105b truncates before
+                # writing the answer.
+                salvaged = _extract_user_answer(reasoning)
+                if salvaged:
+                    debug["fallback_used"] = True
+                    _record_ai_debug(debug)
+                    note = "*(generated from reasoning trace — model didn't finalise a clean answer; consider retrying)*\n\n"
+                    return note + salvaged
+
+        _record_ai_debug(debug)
     except requests.exceptions.Timeout:
         _record_ai_debug({"model": "sarvam-105b", "error": "Timed out after 240s"})
     except Exception as e:
@@ -1843,8 +1881,10 @@ Current Nifty and Bank Nifty levels (from live data), USD/INR rate, RBI stance, 
 2–3 bullets. Biggest near-term risks.
 
 Keep each section to 3–4 sentences/bullets. No filler.
+
+Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output.
 """
-    result = call_ai(prompt, system=system, max_tokens=6000)
+    result = call_ai(prompt, system=system, max_tokens=24000)
     return result if result.strip() else "Market intelligence could not be generated."
 
 # =============================
@@ -1968,12 +2008,16 @@ One ticker per row, exactly 3 rows.
 **WATCHLIST** 3 stocks from STOCK SCAN, one bullet each.
 **SECTOR TO OWN** 1 sector+ETF ticker, 2 sentences.
 **AVOID** 2 bullets, not Top 3 picks.
-**TAIL RISKS** 2 bullets."""
+**TAIL RISKS** 2 bullets.
+
+Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output."""
 
     # sarvam-105b is a reasoning model — it uses tokens for internal thinking
     # (reasoning_content) BEFORE writing the actual response (content).
-    # max_tokens must cover BOTH. 1500 was exhausted by reasoning alone → content=null.
-    result = call_ai(prompt, system=system, max_tokens=6000)
+    # max_tokens must cover BOTH. call_ai now also salvages content from
+    # reasoning_content when finish_reason=length, so output is never empty
+    # for a successful 200 response.
+    result = call_ai(prompt, system=system, max_tokens=24000)
     if result.strip():
         return result
 
@@ -1981,8 +2025,10 @@ One ticker per row, exactly 3 rows.
     mini = f"""{now_ist().strftime('%d %b %Y')}
 MACRO:{macro_facts[:300]}
 STOCK SCAN (picks must come ONLY from here, no ETFs):{stocks_short[:400]}
-Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN only. **AVOID** 2 bullets."""
-    result = call_ai(mini, system=system, max_tokens=6000)
+Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN only. **AVOID** 2 bullets.
+
+Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output."""
+    result = call_ai(mini, system=system, max_tokens=16000)
     return result if result.strip() else "Strategy unavailable — API timeout. Scan data above is valid."
 
 # =============================
@@ -2465,10 +2511,11 @@ if "strategy" in st.session_state:
                         f"DCF upside { _num((m.get('dcf') or {}).get('upside_pct'), suffix='%') }. "
                         f"Action: {rec.get('action')}, conviction {rec.get('conviction')}. "
                         f"Write a 4-sentence investment thesis covering: 1) setup, 2) fundamentals, "
-                        f"3) valuation, 4) primary risk."
+                        f"3) valuation, 4) primary risk. "
+                        f"Output the thesis directly. Do not reproduce planning, instructions, or deliberation."
                     )
                     with st.spinner("Drafting thesis …"):
-                        thesis = call_ai(prompt_th, system=sys, max_tokens=600)
+                        thesis = call_ai(prompt_th, system=sys, max_tokens=16000)
                     if thesis:
                         st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
                     else:
