@@ -1,13 +1,28 @@
 from __future__ import annotations
 import re
+import io
+import time
+import math
 import streamlit as st
 import requests
-import io
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tavily import TavilyClient
+
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist() -> datetime:
+    return datetime.now(tz=IST)
+
+def fmt_ist(fmt: str = "%d %b %Y · %H:%M IST") -> str:
+    return now_ist().strftime(fmt)
 
 # =============================
 # API CONFIG
@@ -24,6 +39,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 # =============================
 
 MA_PERIOD          = 50
+MA_LONG_PERIOD     = 200
 BREAKOUT_LOOKBACK  = 20
 VOL_LOOKBACK       = 20
 VOL_SURGE_THRESH   = 1.8
@@ -33,6 +49,22 @@ CHUNK_SIZE         = 80
 MAX_DISPLAY_STOCKS = 12
 RSI_PERIOD         = 14
 RSI_OVERBOUGHT     = 72   # stocks above this are excluded from Top 3 picks
+
+# ── Rally classifier / shortlist ────────────────────────────────────
+SHORTLIST_TARGET     = 25
+SHORTLIST_MIN_SCORE  = 55.0
+SHORTLIST_FLOOR      = 10
+FUND_WORKERS         = 8
+FUND_CACHE_TTL_SEC   = 21600   # 6 h
+
+STAGE_LABELS = {
+    0: "—",
+    1: "Accumulation",
+    2: "Early Markup",
+    3: "Breakout",
+    4: "Extended",
+}
+STAGE_WEIGHTS = {0: 0.20, 1: 0.85, 2: 1.00, 3: 0.75, 4: 0.15}
 
 # =============================
 # ETF REGISTRY — fetched live from NSE, zero hardcoding
@@ -275,9 +307,9 @@ st.markdown(f"""
     </div>
     <div class="nse-tagline">
         Market Intelligence &nbsp;·&nbsp;
-        <em>{datetime.now().strftime("%d %b %Y")}</em> &nbsp;·&nbsp;
-        <em>{datetime.now().strftime("%H:%M IST")}</em> &nbsp;·&nbsp;
-        <em>Equity Momentum Scanner</em>
+        <em>{now_ist().strftime("%d %b %Y")}</em> &nbsp;·&nbsp;
+        <em>{now_ist().strftime("%H:%M IST")}</em> &nbsp;·&nbsp;
+        <em>Rally Detector · Fundamentals · Deep Dive</em>
     </div>
     <div class="header-divider"></div>
 </div>
@@ -371,6 +403,237 @@ def compute_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
     atr = tr.rolling(period).mean().iloc[-1]
     price = df["Close"].iloc[-1]
     return round(float(atr / price * 100), 2) if price else np.nan
+
+# =============================
+# EXPANDED TECHNICAL HELPERS
+# =============================
+
+def _safe_last(series: pd.Series) -> float:
+    try:
+        v = float(series.dropna().iloc[-1])
+        return v if np.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
+
+def compute_ma(series: pd.Series, period: int) -> float:
+    if len(series) < period:
+        return np.nan
+    return _safe_last(series.rolling(period).mean())
+
+def compute_ema_series(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
+    """Return (macd_last, signal_last, hist_last, hist_series)."""
+    if len(series) < slow + signal:
+        return np.nan, np.nan, np.nan, pd.Series(dtype=float)
+    ema_fast = compute_ema_series(series, fast)
+    ema_slow = compute_ema_series(series, slow)
+    macd     = ema_fast - ema_slow
+    sig      = compute_ema_series(macd, signal)
+    hist     = macd - sig
+    return _safe_last(macd), _safe_last(sig), _safe_last(hist), hist
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> tuple:
+    """Wilder ADX. Returns (adx_last, plus_di_last, minus_di_last)."""
+    if len(df) < period * 2 + 1:
+        return np.nan, np.nan, np.nan
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr        = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    # Wilder smoothing via ewm with alpha=1/period
+    atr_w     = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di   = 100 * pd.Series(plus_dm,  index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di  = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx       = dx.ewm(alpha=1/period, adjust=False).mean()
+    return _safe_last(adx), _safe_last(plus_di), _safe_last(minus_di)
+
+def compute_adx_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if len(df) < period * 2 + 1:
+        return pd.Series(dtype=float)
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr        = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr_w     = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di   = 100 * pd.Series(plus_dm,  index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di  = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
+
+def compute_roc(series: pd.Series, period: int = 20) -> float:
+    if len(series) < period + 1:
+        return np.nan
+    try:
+        ref = float(series.iloc[-period - 1])
+        if ref == 0:
+            return np.nan
+        return round((float(series.iloc[-1]) / ref - 1) * 100, 2)
+    except Exception:
+        return np.nan
+
+def compute_obv_slope(close: pd.Series, volume: pd.Series, window: int = 20) -> float:
+    if len(close) < window + 5:
+        return np.nan
+    obv = (np.sign(close.diff().fillna(0)) * volume.fillna(0)).cumsum()
+    tail = obv.iloc[-window:]
+    if tail.std() == 0 or len(tail) < window:
+        return 0.0
+    x = np.arange(len(tail))
+    try:
+        slope, _ = np.polyfit(x, tail.values, 1)
+        # Normalise by mean OBV magnitude
+        denom = max(abs(tail.mean()), 1.0)
+        return round(float(slope) / denom, 6)
+    except Exception:
+        return np.nan
+
+def compute_rs_vs_nifty(close: pd.Series, nifty_close: pd.Series, period: int = 63) -> float:
+    if nifty_close is None or len(nifty_close) < period + 1 or len(close) < period + 1:
+        return np.nan
+    try:
+        stock_ret  = float(close.iloc[-1])  / float(close.iloc[-period - 1])
+        nifty_ret  = float(nifty_close.iloc[-1]) / float(nifty_close.iloc[-period - 1])
+        if nifty_ret == 0:
+            return np.nan
+        return round(stock_ret / nifty_ret, 3)
+    except Exception:
+        return np.nan
+
+def compute_bb_width_series(series: pd.Series, period: int = 20, k: float = 2.0) -> pd.Series:
+    if len(series) < period:
+        return pd.Series(dtype=float)
+    mid   = series.rolling(period).mean()
+    std   = series.rolling(period).std()
+    upper = mid + k * std
+    lower = mid - k * std
+    return (upper - lower) / mid.replace(0, np.nan)
+
+def is_bb_squeeze(series: pd.Series, period: int = 20, k: float = 2.0, lookback: int = 120, pct: float = 0.25) -> bool:
+    bbw = compute_bb_width_series(series, period, k).dropna()
+    if len(bbw) < lookback:
+        return False
+    tail = bbw.iloc[-lookback:]
+    last = float(tail.iloc[-1])
+    threshold = float(tail.quantile(pct))
+    return last <= threshold
+
+def slope_pct(series: pd.Series, window: int = 20) -> float:
+    """Approximate trend slope as percentage change over `window` bars."""
+    if len(series) < window + 1:
+        return np.nan
+    try:
+        a = float(series.iloc[-window - 1])
+        b = float(series.iloc[-1])
+        if a == 0:
+            return np.nan
+        return round((b / a - 1) * 100, 2)
+    except Exception:
+        return np.nan
+
+def dist_from_ma(price: float, ma: float) -> float:
+    if not ma or ma <= 0 or not np.isfinite(price) or not np.isfinite(ma):
+        return np.nan
+    return round((price / ma - 1) * 100, 2)
+
+# =============================
+# RALLY STAGE CLASSIFIER
+# =============================
+
+def classify_stage(m: dict) -> tuple:
+    """
+    Classify a stock's rally stage from a metrics dict produced in scan_market.
+    Returns (stage_id, stage_label). Stages are evaluated 4 → 1 (extended first,
+    then breakout, early markup, accumulation) so the most advanced setup wins.
+    """
+    price    = m.get("price")
+    ma50     = m.get("ma50")
+    ma200    = m.get("ma200")
+    ma50_slope10 = m.get("ma50_slope10")
+    ma200_slope20 = m.get("ma200_slope20")
+    rsi      = m.get("rsi")
+    adx      = m.get("adx")
+    adx_prev = m.get("adx_prev")
+    macd_hist = m.get("macd_hist")
+    macd_above_signal = m.get("macd_above_signal")
+    macd_cross_recent = m.get("macd_cross_recent")
+    obv_slope = m.get("obv_slope")
+    rs_nifty = m.get("rs_nifty")
+    vol_ratio = m.get("vol_ratio")
+    high20 = m.get("high20")
+    bb_squeeze = m.get("bb_squeeze")
+    dist_ma200 = m.get("dist_ma200")
+    dist_ma50  = m.get("dist_ma50")
+    is_breakout = m.get("is_breakout")
+
+    def _f(x):
+        try: return float(x)
+        except Exception: return np.nan
+
+    # Stage 4 — Extended / climax
+    s4_signals = []
+    if np.isfinite(_f(dist_ma50)) and _f(dist_ma50) > 25:
+        s4_signals.append(True)
+    if np.isfinite(_f(rsi)) and _f(rsi) > 75:
+        s4_signals.append(True)
+    if np.isfinite(_f(dist_ma200)) and _f(dist_ma200) > 60:
+        s4_signals.append(True)
+    if np.isfinite(_f(adx)) and _f(adx) > 50:
+        s4_signals.append(True)
+    if any(s4_signals):
+        return 4, STAGE_LABELS[4]
+
+    # Stage 3 — Breakout
+    if is_breakout and np.isfinite(_f(macd_hist)) and _f(macd_hist) > 0 \
+        and np.isfinite(_f(adx)) and _f(adx) > 25 \
+        and np.isfinite(_f(vol_ratio)) and _f(vol_ratio) > 1.5 \
+        and np.isfinite(_f(rsi)) and 55 <= _f(rsi) <= 72:
+        return 3, STAGE_LABELS[3]
+
+    # Stage 2 — Early Markup
+    cond_s2 = (
+        np.isfinite(_f(price)) and np.isfinite(_f(ma50)) and np.isfinite(_f(ma200))
+        and _f(price) > _f(ma50) > _f(ma200)
+        and np.isfinite(_f(ma50_slope10)) and _f(ma50_slope10) > 0
+        and (macd_above_signal or macd_cross_recent)
+        and np.isfinite(_f(adx)) and 18 <= _f(adx) <= 30
+        and (not np.isfinite(_f(adx_prev)) or _f(adx) >= _f(adx_prev))
+        and np.isfinite(_f(rsi)) and 50 <= _f(rsi) <= 65
+        and np.isfinite(_f(high20)) and _f(price) < _f(high20) * BREAKOUT_TOLERANCE
+        and np.isfinite(_f(rs_nifty)) and _f(rs_nifty) > 1.0
+    )
+    if cond_s2:
+        return 2, STAGE_LABELS[2]
+
+    # Stage 1 — Accumulation
+    cond_s1 = (
+        np.isfinite(_f(price)) and np.isfinite(_f(ma200))
+        and abs(_f(price) / _f(ma200) - 1) <= 0.08
+        and (not np.isfinite(_f(ma200_slope20)) or _f(ma200_slope20) >= -1.0)
+        and bool(bb_squeeze)
+        and np.isfinite(_f(adx)) and _f(adx) < 20
+        and (not np.isfinite(_f(obv_slope)) or _f(obv_slope) >= 0)
+        and np.isfinite(_f(rsi)) and 40 <= _f(rsi) <= 55
+    )
+    if cond_s1:
+        return 1, STAGE_LABELS[1]
+
+    return 0, STAGE_LABELS[0]
 
 def estimate_upside(df: pd.DataFrame, price: float, high20: float) -> dict:
     high52 = df["High"].iloc[-252:].max() if len(df) >= 252 else df["High"].max()
@@ -503,7 +766,17 @@ def build_etf_context(etf_df: pd.DataFrame) -> str:
 # MOMENTUM SCANNER
 # =============================
 
-def scan_market(symbols: list, _counter=None, _pbar=None) -> pd.DataFrame:
+def get_nifty_close(period: str = "1y") -> pd.Series:
+    """Fetch ^NSEI close series once per scan for RS calculations."""
+    try:
+        hist = yf.Ticker("^NSEI").history(period=period, interval="1d", auto_adjust=True)
+        if hist.empty:
+            return pd.Series(dtype=float)
+        return hist["Close"].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
+
+def scan_market(symbols: list, _counter=None, _pbar=None, nifty_close: pd.Series | None = None) -> pd.DataFrame:
     results = []
     failed  = []
     total   = len(symbols)
@@ -534,32 +807,102 @@ def scan_market(symbols: list, _counter=None, _pbar=None) -> pd.DataFrame:
         for ticker in tickers:
             try:
                 df = data[ticker] if len(tickers) > 1 else data
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
                 df = df.dropna(subset=["Close", "Volume"])
                 if len(df) < MIN_BARS:
                     continue
-                price     = float(df["Close"].iloc[-1])
-                ma50      = float(df["Close"].rolling(MA_PERIOD).mean().iloc[-1])
+                close = df["Close"]
+                price        = float(close.iloc[-1])
+                ma50         = compute_ma(close, MA_PERIOD)
+                ma200        = compute_ma(close, MA_LONG_PERIOD)
+                ma50_series  = close.rolling(MA_PERIOD).mean()
+                ma200_series = close.rolling(MA_LONG_PERIOD).mean()
+                ma50_slope10  = slope_pct(ma50_series.dropna(),  window=10)  if ma50_series.notna().sum()  >= 11 else np.nan
+                ma200_slope20 = slope_pct(ma200_series.dropna(), window=20)  if ma200_series.notna().sum() >= 21 else np.nan
+
                 high20    = float(df["High"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
                 vol_avg   = float(df["Volume"].iloc[-(VOL_LOOKBACK + 1):-1].mean())
                 vol_now   = float(df["Volume"].iloc[-1])
                 vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
-                rsi       = compute_rsi(df["Close"])
+                rsi       = compute_rsi(close)
+                atr_pct   = compute_atr_pct(df)
                 upside    = estimate_upside(df, price, high20)
+
+                macd_last, sig_last, hist_last, hist_series = compute_macd(close)
+                macd_above_signal = bool(np.isfinite(macd_last) and np.isfinite(sig_last) and macd_last > sig_last)
+                macd_cross_recent = False
+                if len(hist_series.dropna()) >= 11:
+                    tail = hist_series.dropna().iloc[-11:]
+                    macd_cross_recent = bool(((tail.shift(1) < 0) & (tail > 0)).any())
+
+                adx_series = compute_adx_series(df)
+                if len(adx_series.dropna()) >= 6:
+                    adx_now  = _safe_last(adx_series)
+                    adx_prev = float(adx_series.dropna().iloc[-6])
+                else:
+                    adx_now, adx_prev = np.nan, np.nan
+                _, plus_di, minus_di = compute_adx(df)
+
+                roc20      = compute_roc(close, 20)
+                obv_slope  = compute_obv_slope(close, df["Volume"])
+                rs_nifty   = compute_rs_vs_nifty(close, nifty_close) if nifty_close is not None and not nifty_close.empty else np.nan
+                bb_squeeze = is_bb_squeeze(close)
+                d_ma50     = dist_from_ma(price, ma50)
+                d_ma200    = dist_from_ma(price, ma200)
+
                 is_breakout  = price >= high20 * BREAKOUT_TOLERANCE
                 is_vol_surge = vol_ratio > VOL_SURGE_THRESH
-                if price > ma50 and (is_breakout or is_vol_surge):
-                    results.append({
-                        "Ticker"       : ticker.replace(".NS", ""),
-                        "Price ₹"      : round(price, 2),
-                        "MA50"         : round(ma50, 2),
-                        "RSI"          : rsi,
-                        "Vol Ratio"    : round(vol_ratio, 2),
-                        "Signal"       : "Breakout" if is_breakout else "Building",
-                        "Target ₹"     : upside["target"],
-                        "Upside %"     : upside["upside_pct"],
-                        "52W High ₹"   : upside["high52"],
-                        "Gap to 52W %" : upside["high52_gap_pct"],
-                    })
+
+                metrics = {
+                    "price": price, "ma50": ma50, "ma200": ma200,
+                    "ma50_slope10": ma50_slope10, "ma200_slope20": ma200_slope20,
+                    "rsi": rsi, "adx": adx_now, "adx_prev": adx_prev,
+                    "macd_hist": hist_last, "macd_above_signal": macd_above_signal,
+                    "macd_cross_recent": macd_cross_recent,
+                    "obv_slope": obv_slope, "rs_nifty": rs_nifty,
+                    "vol_ratio": vol_ratio, "high20": high20,
+                    "bb_squeeze": bb_squeeze,
+                    "dist_ma200": d_ma200, "dist_ma50": d_ma50,
+                    "is_breakout": is_breakout,
+                }
+                stage_id, stage_lbl = classify_stage(metrics)
+
+                # Keep the row if EITHER the stage is meaningful (1-3) OR the
+                # legacy breakout/volume condition fires above MA50. Stage 4
+                # rows are still emitted (downweighted by score later).
+                stage_pass  = stage_id in (1, 2, 3)
+                legacy_pass = (np.isfinite(ma50) and price > ma50) and (is_breakout or is_vol_surge)
+                if not (stage_pass or legacy_pass or stage_id == 4):
+                    continue
+
+                signal = "Breakout" if is_breakout else ("Building" if is_vol_surge else stage_lbl)
+
+                results.append({
+                    "Ticker"       : ticker.replace(".NS", ""),
+                    "Price ₹"      : round(price, 2),
+                    "MA50"         : round(ma50, 2) if np.isfinite(ma50) else np.nan,
+                    "MA200"        : round(ma200, 2) if np.isfinite(ma200) else np.nan,
+                    "RSI"          : rsi,
+                    "Vol Ratio"    : round(vol_ratio, 2),
+                    "Signal"       : signal,
+                    "Stage"        : stage_lbl,
+                    "StageId"      : stage_id,
+                    "ADX"          : round(adx_now, 1) if np.isfinite(adx_now) else np.nan,
+                    "+DI"          : round(plus_di, 1) if np.isfinite(plus_di) else np.nan,
+                    "-DI"          : round(minus_di, 1) if np.isfinite(minus_di) else np.nan,
+                    "MACD Hist"    : round(hist_last, 3) if np.isfinite(hist_last) else np.nan,
+                    "ROC20 %"      : roc20,
+                    "OBV Slope"    : obv_slope,
+                    "RS vs Nifty"  : rs_nifty,
+                    "Dist MA50 %"  : d_ma50,
+                    "Dist MA200 %" : d_ma200,
+                    "ATR %"        : atr_pct,
+                    "Target ₹"     : upside["target"],
+                    "Upside %"     : upside["upside_pct"],
+                    "52W High ₹"   : upside["high52"],
+                    "Gap to 52W %" : upside["high52_gap_pct"],
+                })
             except Exception as e:
                 failed.append((ticker, str(e)))
 
@@ -571,11 +914,658 @@ def scan_market(symbols: list, _counter=None, _pbar=None) -> pd.DataFrame:
         st.caption(f"⚠ {len(failed)} tickers skipped. First 5: {[f[0] for f in failed[:5]]}")
     if not results:
         return pd.DataFrame()
-    return (
-        pd.DataFrame(results)
-        .sort_values(["Signal", "Vol Ratio"], ascending=[True, False])
-        .reset_index(drop=True)
+    df = pd.DataFrame(results)
+    df = compute_composite_score(df)
+    return df.sort_values("Score", ascending=False).reset_index(drop=True)
+
+
+# =============================
+# COMPOSITE SCORING
+# =============================
+
+def _rsi_health(r):
+    if not np.isfinite(r):
+        return 0.4
+    if 50 <= r <= 65:
+        return 1.0
+    if 40 <= r < 50 or 65 < r <= 72:
+        return 0.8
+    return 0.4
+
+def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach a 0–100 Score column blending stage, momentum, trend & RS."""
+    if df.empty:
+        return df
+    d = df.copy()
+    stage_w  = d["StageId"].map(STAGE_WEIGHTS).fillna(0.2)
+    vol_w    = (d["Vol Ratio"].fillna(0) / 3.0).clip(0, 1)
+    rsi_w    = d["RSI"].apply(_rsi_health)
+    hist     = d["MACD Hist"].fillna(0.0)
+    hist_std = hist.std() if hist.std() and hist.std() > 0 else 1.0
+    macd_w   = (hist / hist_std).clip(lower=0, upper=1)
+    adx_w    = ((d["ADX"].fillna(0) - 15).clip(lower=0) / 25).clip(upper=1)
+    rs_w     = ((d["RS vs Nifty"].fillna(1.0) - 1.0) * 5).clip(0, 1)
+    up_w     = (d["Upside %"].fillna(0) / 30).clip(0, 1)
+
+    score = 100 * (
+        0.30 * stage_w +
+        0.15 * vol_w   +
+        0.10 * rsi_w   +
+        0.15 * macd_w  +
+        0.15 * adx_w   +
+        0.10 * rs_w    +
+        0.05 * up_w
     )
+    d["Score"] = score.round(1)
+    return d
+
+def build_shortlist(df: pd.DataFrame) -> pd.DataFrame:
+    """Top N rows above score threshold, with a floor."""
+    if df.empty or "Score" not in df.columns:
+        return df.head(0)
+    above = df[df["Score"] >= SHORTLIST_MIN_SCORE].sort_values("Score", ascending=False)
+    if len(above) >= SHORTLIST_FLOOR:
+        return above.head(SHORTLIST_TARGET).reset_index(drop=True)
+    # Fall back: take top SHORTLIST_FLOOR overall
+    return df.sort_values("Score", ascending=False).head(SHORTLIST_FLOOR).reset_index(drop=True)
+
+# =============================
+# FUNDAMENTALS LAYER (free, yfinance-only — FMP-equivalent)
+# =============================
+
+def _safe(fn, default=None):
+    try:
+        v = fn()
+        if v is None:
+            return default
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return default
+        return v
+    except Exception:
+        return default
+
+def _first_row(df_like, candidates):
+    """Return Series for first matching row label found in candidates."""
+    if df_like is None or len(df_like) == 0:
+        return None
+    if not hasattr(df_like, "index"):
+        return None
+    idx = [str(x) for x in df_like.index]
+    for cand in candidates:
+        for i, label in enumerate(idx):
+            if cand.lower() in label.lower():
+                try:
+                    return df_like.iloc[i]
+                except Exception:
+                    continue
+    return None
+
+def _cagr(series_values, years):
+    try:
+        vals = [float(v) for v in series_values if v is not None and np.isfinite(float(v))]
+        if len(vals) < 2 or years < 1:
+            return None
+        oldest, latest = vals[-1], vals[0]   # yfinance returns newest first
+        if oldest <= 0 or latest <= 0:
+            return None
+        return (latest / oldest) ** (1 / years) - 1
+    except Exception:
+        return None
+
+def compute_dcf(info: dict, cashflow: pd.DataFrame, balance: pd.DataFrame) -> dict:
+    """
+    Simple 5-yr DCF: project FCF using historical CAGR (clipped 4-18%),
+    fall back to info.earningsGrowth, else 10%. Discount 12%, terminal 4%.
+    Returns dict with intrinsic_per_share, upside_pct, assumptions, confidence.
+    """
+    out = {"intrinsic_per_share": None, "upside_pct": None,
+           "assumptions": {}, "confidence": "low"}
+
+    fcf_row = _first_row(cashflow, ["Free Cash Flow"])
+    if fcf_row is None:
+        ocf = _first_row(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+        capex = _first_row(cashflow, ["Capital Expenditure"])
+        if ocf is not None and capex is not None:
+            try:
+                fcf_row = ocf.add(capex, fill_value=0)  # capex is negative in yfinance
+            except Exception:
+                fcf_row = None
+
+    if fcf_row is None or fcf_row.dropna().empty:
+        return out
+
+    fcf_values = [float(v) for v in fcf_row.dropna().tolist() if np.isfinite(float(v))]
+    if not fcf_values:
+        return out
+
+    base_fcf = fcf_values[0]
+    if base_fcf <= 0:
+        return out
+
+    growth = _cagr(fcf_values, min(3, len(fcf_values) - 1))
+    if growth is None:
+        growth = _safe(lambda: float(info.get("earningsGrowth")))
+    if growth is None:
+        growth = 0.10
+    growth = max(0.04, min(0.18, float(growth)))
+
+    r, g = 0.12, 0.04
+    discounted = 0.0
+    proj_fcf = base_fcf
+    for t in range(1, 6):
+        proj_fcf = proj_fcf * (1 + growth)
+        discounted += proj_fcf / ((1 + r) ** t)
+    terminal = proj_fcf * (1 + g) / (r - g)
+    ev = discounted + terminal / ((1 + r) ** 5)
+
+    total_debt = _safe(lambda: float(info.get("totalDebt")), 0.0) or 0.0
+    cash       = _safe(lambda: float(info.get("totalCash")), 0.0) or 0.0
+    shares     = _safe(lambda: float(info.get("sharesOutstanding")))
+    price      = _safe(lambda: float(info.get("currentPrice") or info.get("regularMarketPrice")))
+
+    if not shares or shares <= 0:
+        return out
+
+    equity_value = ev - total_debt + cash
+    intrinsic = equity_value / shares
+    upside_pct = (intrinsic - price) / price * 100 if price and price > 0 else None
+
+    confidence = "high" if len(fcf_values) >= 4 else ("medium" if len(fcf_values) >= 3 else "low")
+
+    out.update({
+        "intrinsic_per_share": round(intrinsic, 2),
+        "upside_pct": round(upside_pct, 1) if upside_pct is not None else None,
+        "assumptions": {
+            "base_fcf": base_fcf, "growth": round(growth, 3),
+            "discount_rate": r, "terminal_growth": g,
+            "fcf_history_years": len(fcf_values),
+        },
+        "confidence": confidence,
+    })
+    return out
+
+@st.cache_data(ttl=FUND_CACHE_TTL_SEC, show_spinner=False)
+def fetch_fundamentals(symbol: str) -> dict:
+    """Pull FMP-equivalent fundamentals from yfinance for a single ticker."""
+    out = {"symbol": symbol, "fetched_at": fmt_ist("%Y-%m-%d %H:%M IST")}
+    try:
+        t = yf.Ticker(symbol)
+        info = _safe(lambda: t.info, default={}) or {}
+        fin  = _safe(lambda: t.financials,  default=pd.DataFrame())
+        bal  = _safe(lambda: t.balance_sheet, default=pd.DataFrame())
+        cf   = _safe(lambda: t.cashflow,    default=pd.DataFrame())
+        eh   = _safe(lambda: t.earnings_history, default=pd.DataFrame())
+        rec  = _safe(lambda: t.recommendations_summary, default=pd.DataFrame())
+        news = _safe(lambda: t.news, default=[]) or []
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+    # ── Identity ───────────────────────────────────────────────
+    out["name"]     = _safe(lambda: info.get("longName") or info.get("shortName"))
+    out["sector"]   = _safe(lambda: info.get("sector"))
+    out["industry"] = _safe(lambda: info.get("industry"))
+    out["country"]  = _safe(lambda: info.get("country"))
+    out["price"]    = _safe(lambda: float(info.get("currentPrice") or info.get("regularMarketPrice")))
+    out["market_cap"] = _safe(lambda: float(info.get("marketCap")))
+
+    # ── Valuation ─────────────────────────────────────────────
+    out["pe_trailing"]    = _safe(lambda: float(info.get("trailingPE")))
+    out["pe_forward"]     = _safe(lambda: float(info.get("forwardPE")))
+    out["pb"]             = _safe(lambda: float(info.get("priceToBook")))
+    out["ev_ebitda"]      = _safe(lambda: float(info.get("enterpriseToEbitda")))
+    out["peg"]            = _safe(lambda: float(info.get("pegRatio")))
+    out["price_to_sales"] = _safe(lambda: float(info.get("priceToSalesTrailing12Months")))
+    out["dividend_yield"] = _safe(lambda: float(info.get("dividendYield")))
+
+    # ── Quality / Profitability ───────────────────────────────
+    out["roe"]            = _safe(lambda: float(info.get("returnOnEquity")))
+    out["roa"]            = _safe(lambda: float(info.get("returnOnAssets")))
+    out["gross_margin"]   = _safe(lambda: float(info.get("grossMargins")))
+    out["op_margin"]      = _safe(lambda: float(info.get("operatingMargins")))
+    out["net_margin"]     = _safe(lambda: float(info.get("profitMargins")))
+    out["debt_to_equity"] = _safe(lambda: float(info.get("debtToEquity")) / 100.0
+                                  if info.get("debtToEquity") is not None else None)
+    out["current_ratio"]  = _safe(lambda: float(info.get("currentRatio")))
+    out["quick_ratio"]    = _safe(lambda: float(info.get("quickRatio")))
+
+    # Derived: ROCE, ROIC, Interest Coverage
+    ebit_row   = _first_row(fin, ["EBIT", "Operating Income"])
+    intexp_row = _first_row(fin, ["Interest Expense"])
+    ta_row     = _first_row(bal, ["Total Assets"])
+    cl_row     = _first_row(bal, ["Current Liabilities", "Total Current Liabilities"])
+    eq_row     = _first_row(bal, ["Total Stockholder Equity", "Stockholders Equity", "Common Stock Equity"])
+    ltd_row    = _first_row(bal, ["Long Term Debt"])
+    cash_row   = _first_row(bal, ["Cash And Cash Equivalents", "Cash"])
+
+    def _latest(row):
+        try:
+            v = float(row.dropna().iloc[0])
+            return v if np.isfinite(v) else None
+        except Exception:
+            return None
+
+    ebit_v = _latest(ebit_row) if ebit_row is not None else None
+    ta_v   = _latest(ta_row)   if ta_row   is not None else None
+    cl_v   = _latest(cl_row)   if cl_row   is not None else None
+    eq_v   = _latest(eq_row)   if eq_row   is not None else None
+    ltd_v  = _latest(ltd_row)  if ltd_row  is not None else None
+    cash_v = _latest(cash_row) if cash_row is not None else None
+    intexp_v = _latest(intexp_row) if intexp_row is not None else None
+
+    if ebit_v and ta_v and cl_v and (ta_v - cl_v) != 0:
+        out["roce"] = round(ebit_v / (ta_v - cl_v), 4)
+    else:
+        out["roce"] = None
+
+    if ebit_v and eq_v:
+        invested = (eq_v or 0) + (ltd_v or 0) - (cash_v or 0)
+        if invested > 0:
+            out["roic"] = round((ebit_v * (1 - 0.25)) / invested, 4)
+        else:
+            out["roic"] = None
+    else:
+        out["roic"] = None
+
+    if ebit_v and intexp_v and intexp_v != 0:
+        out["interest_coverage"] = round(ebit_v / abs(intexp_v), 2)
+    else:
+        out["interest_coverage"] = None
+
+    # ── Growth ───────────────────────────────────────────────
+    rev_row = _first_row(fin, ["Total Revenue", "Revenue"])
+    ni_row  = _first_row(fin, ["Net Income"])
+    shares  = _safe(lambda: float(info.get("sharesOutstanding")))
+
+    if rev_row is not None and not rev_row.dropna().empty:
+        rev_vals = [float(v) for v in rev_row.dropna().tolist() if np.isfinite(float(v))]
+        if len(rev_vals) >= 4:
+            out["rev_cagr_3y"] = _cagr(rev_vals[:4], 3)
+        if len(rev_vals) >= 5:
+            out["rev_cagr_5y"] = _cagr(rev_vals[:5], 4)
+        out["rev_latest"] = rev_vals[0] if rev_vals else None
+    if ni_row is not None and not ni_row.dropna().empty and shares:
+        ni_vals = [float(v) for v in ni_row.dropna().tolist() if np.isfinite(float(v))]
+        eps_vals = [v / shares for v in ni_vals if shares]
+        if len(eps_vals) >= 4:
+            out["eps_cagr_3y"] = _cagr(eps_vals[:4], 3)
+
+    out["earnings_growth"] = _safe(lambda: float(info.get("earningsGrowth")))
+    out["revenue_growth"]  = _safe(lambda: float(info.get("revenueGrowth")))
+    out["fwd_eps_growth"]  = _safe(lambda: (float(info.get("forwardEps")) / float(info.get("trailingEps")) - 1)
+                                   if info.get("forwardEps") and info.get("trailingEps") else None)
+
+    try:
+        if isinstance(eh, pd.DataFrame) and not eh.empty:
+            col = next((c for c in eh.columns if "surprisePercent" in c.lower() or "surprise" in c.lower()), None)
+            if col:
+                surprises = eh[col].dropna().head(4).astype(float).tolist()
+                if surprises:
+                    out["earnings_surprise_avg"] = round(float(np.mean(surprises)), 2)
+    except Exception:
+        pass
+
+    # ── Ownership & Sentiment ───────────────────────────────
+    out["insider_held"]      = _safe(lambda: float(info.get("heldPercentInsiders")))
+    out["institutional_held"] = _safe(lambda: float(info.get("heldPercentInstitutions")))
+    out["recommendation_key"] = _safe(lambda: info.get("recommendationKey"))
+    out["recommendation_mean"] = _safe(lambda: float(info.get("recommendationMean")))
+    out["analyst_count"]     = _safe(lambda: int(info.get("numberOfAnalystOpinions")))
+    out["target_mean"]       = _safe(lambda: float(info.get("targetMeanPrice")))
+    out["target_high"]       = _safe(lambda: float(info.get("targetHighPrice")))
+    out["target_low"]        = _safe(lambda: float(info.get("targetLowPrice")))
+
+    headlines = []
+    for n in (news or [])[:5]:
+        try:
+            title = n.get("title") or n.get("content", {}).get("title")
+            if title:
+                headlines.append(str(title))
+        except Exception:
+            continue
+    out["news_headlines"] = headlines
+
+    # ── DCF ───────────────────────────────────────────────
+    out["dcf"] = compute_dcf(info, cf, bal)
+
+    return out
+
+def fetch_fundamentals_bulk(symbols: list, _status=None, _pbar=None) -> dict:
+    """Parallel fetch for a list of YF symbols (e.g. 'TCS.NS'). Returns dict by symbol."""
+    out = {}
+    total = len(symbols)
+    if total == 0:
+        return out
+    done = 0
+    with ThreadPoolExecutor(max_workers=FUND_WORKERS) as pool:
+        futures = {pool.submit(fetch_fundamentals, s): s for s in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                out[sym] = fut.result()
+            except Exception as e:
+                out[sym] = {"symbol": sym, "error": str(e)}
+            done += 1
+            if _pbar:
+                _pbar.progress(int(done / total * 100))
+            if _status:
+                _status.markdown(
+                    f"<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
+                    f"Fundamentals &nbsp;<strong style='color:#d4a843'>{done}</strong> / {total}</span>",
+                    unsafe_allow_html=True,
+                )
+    return out
+
+# =============================
+# RECOMMENDER
+# =============================
+
+def _pct(v, decimals=1):
+    if v is None or not np.isfinite(v):
+        return "N/A"
+    return f"{v * 100:.{decimals}f}%"
+
+def _num(v, decimals=2, prefix="", suffix=""):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return "N/A"
+    return f"{prefix}{v:,.{decimals}f}{suffix}"
+
+def _coalesce(v, default):
+    """Return default if v is None or NaN; else v."""
+    try:
+        if v is None:
+            return default
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return default
+        return v
+    except Exception:
+        return default
+
+def recommend_action(metrics: dict, tech: dict) -> dict:
+    """
+    metrics = fundamentals dict from fetch_fundamentals.
+    tech    = single-stock row from the momentum scan (Score, Stage, ATR %, RSI, ADX, RS, Upside %, etc.).
+    Returns {action, conviction, bull_case, bear_case, entry_zone, stop_loss, targets}.
+    """
+    price = _coalesce(tech.get("Price ₹"), _coalesce(metrics.get("price"), 0))
+    atrp  = _coalesce(tech.get("ATR %"), 3.0)
+    try:
+        stage_id = int(_coalesce(tech.get("StageId"), 0))
+    except Exception:
+        stage_id = 0
+
+    # Component scores 0–100
+    tech_score = float(_coalesce(tech.get("Score"), 0))
+
+    qty_inputs = [
+        (metrics.get("roe"),           lambda v: 1.0 if v and v > 0.18 else (0.6 if v and v > 0.12 else 0.2)),
+        (metrics.get("op_margin"),     lambda v: 1.0 if v and v > 0.15 else (0.6 if v and v > 0.08 else 0.2)),
+        (metrics.get("debt_to_equity"),lambda v: 0.2 if v and v > 1.5 else (0.6 if v and v > 0.7 else 1.0)),
+        (metrics.get("interest_coverage"), lambda v: 1.0 if v and v > 6 else (0.5 if v and v > 3 else 0.1)),
+    ]
+    qparts = [f(v) for v, f in qty_inputs if v is not None]
+    quality_score = 100 * (sum(qparts) / len(qparts)) if qparts else 50.0
+
+    val_inputs = []
+    pe = metrics.get("pe_forward") or metrics.get("pe_trailing")
+    if pe and pe > 0:
+        val_inputs.append(1.0 if pe < 20 else (0.7 if pe < 35 else (0.4 if pe < 60 else 0.1)))
+    peg = metrics.get("peg")
+    if peg and peg > 0:
+        val_inputs.append(1.0 if peg < 1 else (0.6 if peg < 2 else 0.2))
+    dcf_up = (metrics.get("dcf") or {}).get("upside_pct")
+    if dcf_up is not None:
+        val_inputs.append(1.0 if dcf_up > 20 else (0.6 if dcf_up > 0 else 0.2))
+    value_score = 100 * (sum(val_inputs) / len(val_inputs)) if val_inputs else 50.0
+
+    g_inputs = []
+    rg = metrics.get("rev_cagr_3y")
+    if rg is not None:
+        g_inputs.append(1.0 if rg > 0.15 else (0.6 if rg > 0.07 else 0.2))
+    eg = metrics.get("eps_cagr_3y")
+    if eg is not None:
+        g_inputs.append(1.0 if eg > 0.15 else (0.6 if eg > 0.07 else 0.2))
+    fg = metrics.get("fwd_eps_growth")
+    if fg is not None:
+        g_inputs.append(1.0 if fg > 0.10 else (0.6 if fg > 0 else 0.2))
+    growth_score = 100 * (sum(g_inputs) / len(g_inputs)) if g_inputs else 50.0
+
+    conviction = 0.4 * tech_score + 0.3 * quality_score + 0.2 * value_score + 0.1 * growth_score
+    conviction = round(max(0, min(100, conviction)), 1)
+
+    def _gt(v, thr):
+        v = _coalesce(v, None)
+        return v is not None and v > thr
+    def _lt(v, thr):
+        v = _coalesce(v, None)
+        return v is not None and v < thr
+
+    # Bull / bear flags
+    bull = []
+    if _gt(metrics.get("roe"), 0.18):                    bull.append(f"ROE {metrics['roe']*100:.1f}% > 18%")
+    if _gt(metrics.get("op_margin"), 0.15):              bull.append(f"Operating margin {metrics['op_margin']*100:.1f}% > 15%")
+    if _gt(metrics.get("rev_cagr_3y"), 0.15):            bull.append(f"Revenue 3Y CAGR {metrics['rev_cagr_3y']*100:.1f}%")
+    if _gt(dcf_up, 20):                                  bull.append(f"DCF upside {dcf_up:.1f}%")
+    if stage_id in (1, 2):                               bull.append(f"Stage {stage_id} setup ({STAGE_LABELS[stage_id]})")
+    if _gt(tech.get("RS vs Nifty"), 1.1):                bull.append(f"RS vs Nifty {tech['RS vs Nifty']:.2f}")
+    if _gt(metrics.get("institutional_held"), 0.40):     bull.append(f"Institutional hold {metrics['institutional_held']*100:.0f}%")
+    if _gt(tech.get("ADX"), 25):                         bull.append(f"ADX {tech['ADX']:.0f} (trending)")
+    if _gt(metrics.get("earnings_surprise_avg"), 5):     bull.append(f"Avg earnings surprise +{metrics['earnings_surprise_avg']:.1f}%")
+
+    bear = []
+    if _gt(metrics.get("debt_to_equity"), 1.5):          bear.append(f"D/E {metrics['debt_to_equity']:.2f} > 1.5")
+    if _lt(metrics.get("interest_coverage"), 3):         bear.append(f"Interest cover {metrics['interest_coverage']:.1f}× weak")
+    if _gt(pe, 50) and _gt(peg, 2):                      bear.append(f"Expensive: P/E {pe:.0f}, PEG {peg:.1f}")
+    if stage_id == 4:                                    bear.append("Stage 4 — extended / climax risk")
+    if _lt(metrics.get("rev_cagr_3y"), 0):               bear.append(f"Revenue declining ({metrics['rev_cagr_3y']*100:.1f}% 3Y CAGR)")
+    if _lt(metrics.get("op_margin"), 0.05):              bear.append("Operating margin < 5%")
+    if _lt(dcf_up, -20):                                 bear.append(f"DCF says overvalued ({dcf_up:.0f}%)")
+
+    bull_case = bull[:3] if bull else ["No standout positives"]
+    bear_case = bear[:3] if bear else ["No critical red flags"]
+
+    critical_bear = any(b in bear for b in [
+        f"D/E {metrics.get('debt_to_equity', 0):.2f} > 1.5",
+        "Stage 4 — extended / climax risk",
+    ])
+
+    if stage_id == 4:
+        action = "AVOID"
+    elif conviction >= 80 and not critical_bear:
+        action = "STRONG_BUY"
+    elif conviction >= 65:
+        action = "BUY"
+    elif conviction >= 50:
+        action = "ACCUMULATE"
+    elif conviction >= 35:
+        action = "HOLD"
+    else:
+        action = "AVOID"
+
+    # Entry / stop / targets
+    atrp_use = atrp if (isinstance(atrp, (int, float)) and np.isfinite(atrp) and atrp > 0) else 3.0
+    price_v = price if (isinstance(price, (int, float)) and np.isfinite(price) and price > 0) else None
+    entry_low  = round(price_v * (1 - 0.5 * atrp_use / 100), 2) if price_v else None
+    entry_high = round(price_v, 2) if price_v else None
+    stop       = round(price_v * (1 - 2 * atrp_use / 100), 2) if price_v else None
+
+    targets = {}
+    if tech.get("Target ₹"):
+        targets["fib"] = float(tech["Target ₹"])
+    if metrics.get("target_mean"):
+        targets["analyst_mean"] = float(metrics["target_mean"])
+    dcf_intrinsic = (metrics.get("dcf") or {}).get("intrinsic_per_share")
+    if dcf_intrinsic:
+        targets["dcf"] = float(dcf_intrinsic)
+
+    return {
+        "action": action,
+        "conviction": conviction,
+        "scores": {
+            "technical": round(tech_score, 1),
+            "quality":   round(quality_score, 1),
+            "value":     round(value_score, 1),
+            "growth":    round(growth_score, 1),
+        },
+        "bull_case": bull_case,
+        "bear_case": bear_case,
+        "entry_zone": (entry_low, entry_high),
+        "stop_loss": stop,
+        "targets": targets,
+    }
+
+def analyze_stock_fundamentals(symbol: str, technicals_row: dict) -> dict:
+    """Fetch fundamentals (cached) and merge with technicals into a recommendation."""
+    metrics = fetch_fundamentals(symbol)
+    rec     = recommend_action(metrics, technicals_row)
+    return {"symbol": symbol, "metrics": metrics, "technicals": technicals_row, "recommendation": rec}
+
+# =============================
+# EXCEL EXPORT
+# =============================
+
+def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
+    """One flat row for the Summary sheet."""
+    dcf = m.get("dcf") or {}
+    return {
+        "Ticker": sym_no_suffix,
+        "Name": m.get("name"),
+        "Sector": m.get("sector"),
+        "Industry": m.get("industry"),
+        "Price ₹": t.get("Price ₹"),
+        "Stage": t.get("Stage"),
+        "Score": t.get("Score"),
+        "Action": rec.get("action"),
+        "Conviction": rec.get("conviction"),
+        "Upside % (tech)": t.get("Upside %"),
+        "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
+        "DCF Upside %": dcf.get("upside_pct"),
+        "P/E (fwd)": m.get("pe_forward"),
+        "P/B": m.get("pb"),
+        "EV/EBITDA": m.get("ev_ebitda"),
+        "ROE %": (m.get("roe") or 0) * 100 if m.get("roe") is not None else None,
+        "ROCE %": (m.get("roce") or 0) * 100 if m.get("roce") is not None else None,
+        "Op Margin %": (m.get("op_margin") or 0) * 100 if m.get("op_margin") is not None else None,
+        "D/E": m.get("debt_to_equity"),
+        "Rev CAGR 3Y %": (m.get("rev_cagr_3y") or 0) * 100 if m.get("rev_cagr_3y") is not None else None,
+        "Inst Hold %": (m.get("institutional_held") or 0) * 100 if m.get("institutional_held") is not None else None,
+        "Analyst Rec": m.get("recommendation_key"),
+    }
+
+def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund_map: dict) -> bytes:
+    """
+    Return XLSX bytes. Sheets:
+      Full Scan, Summary, Valuation, Quality, Growth, Ownership, Recommendation,
+      and one vertical sheet per shortlisted stock (cap 25).
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        if scan_df is not None and not scan_df.empty:
+            scan_df.to_excel(writer, sheet_name="Full Scan", index=False)
+
+        rows_summary, rows_val, rows_q, rows_g, rows_o, rows_rec = [], [], [], [], [], []
+
+        for _, t_row in shortlist_df.iterrows():
+            ticker_no = t_row["Ticker"]
+            yf_sym = f"{ticker_no}.NS"
+            payload = fund_map.get(yf_sym) or {}
+            m = payload if "metrics" not in payload else payload.get("metrics", {})
+            if "metrics" in payload:
+                m = payload["metrics"]
+                rec = payload["recommendation"]
+            else:
+                rec = recommend_action(m, t_row.to_dict())
+
+            rows_summary.append(_flatten_metrics(ticker_no, m, t_row.to_dict(), rec))
+            dcf = m.get("dcf") or {}
+            rows_val.append({
+                "Ticker": ticker_no,
+                "P/E trailing": m.get("pe_trailing"), "P/E forward": m.get("pe_forward"),
+                "P/B": m.get("pb"), "EV/EBITDA": m.get("ev_ebitda"), "PEG": m.get("peg"),
+                "P/S": m.get("price_to_sales"),
+                "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
+                "DCF Upside %": dcf.get("upside_pct"),
+                "DCF Confidence": dcf.get("confidence"),
+                "Dividend Yield %": (m.get("dividend_yield") or 0) * 100 if m.get("dividend_yield") is not None else None,
+            })
+            rows_q.append({
+                "Ticker": ticker_no,
+                "ROE %": (m.get("roe") or 0) * 100 if m.get("roe") is not None else None,
+                "ROA %": (m.get("roa") or 0) * 100 if m.get("roa") is not None else None,
+                "ROCE %": (m.get("roce") or 0) * 100 if m.get("roce") is not None else None,
+                "ROIC %": (m.get("roic") or 0) * 100 if m.get("roic") is not None else None,
+                "Gross Margin %": (m.get("gross_margin") or 0) * 100 if m.get("gross_margin") is not None else None,
+                "Op Margin %": (m.get("op_margin") or 0) * 100 if m.get("op_margin") is not None else None,
+                "Net Margin %": (m.get("net_margin") or 0) * 100 if m.get("net_margin") is not None else None,
+                "D/E": m.get("debt_to_equity"),
+                "Interest Coverage": m.get("interest_coverage"),
+                "Current Ratio": m.get("current_ratio"),
+                "Quick Ratio": m.get("quick_ratio"),
+            })
+            rows_g.append({
+                "Ticker": ticker_no,
+                "Revenue CAGR 3Y %": (m.get("rev_cagr_3y") or 0) * 100 if m.get("rev_cagr_3y") is not None else None,
+                "Revenue CAGR 5Y %": (m.get("rev_cagr_5y") or 0) * 100 if m.get("rev_cagr_5y") is not None else None,
+                "EPS CAGR 3Y %": (m.get("eps_cagr_3y") or 0) * 100 if m.get("eps_cagr_3y") is not None else None,
+                "Earnings Growth %": (m.get("earnings_growth") or 0) * 100 if m.get("earnings_growth") is not None else None,
+                "Revenue Growth %": (m.get("revenue_growth") or 0) * 100 if m.get("revenue_growth") is not None else None,
+                "Fwd EPS Growth %": (m.get("fwd_eps_growth") or 0) * 100 if m.get("fwd_eps_growth") is not None else None,
+                "Avg Earnings Surprise %": m.get("earnings_surprise_avg"),
+            })
+            rows_o.append({
+                "Ticker": ticker_no,
+                "Insider Held %": (m.get("insider_held") or 0) * 100 if m.get("insider_held") is not None else None,
+                "Institutional Held %": (m.get("institutional_held") or 0) * 100 if m.get("institutional_held") is not None else None,
+                "Analyst Rec": m.get("recommendation_key"),
+                "Rec Mean (1=Strong Buy)": m.get("recommendation_mean"),
+                "Analyst Count": m.get("analyst_count"),
+                "Target Mean ₹": m.get("target_mean"),
+                "Target High ₹": m.get("target_high"),
+                "Target Low ₹":  m.get("target_low"),
+            })
+            rows_rec.append({
+                "Ticker": ticker_no,
+                "Action": rec.get("action"),
+                "Conviction": rec.get("conviction"),
+                "Tech Score": rec.get("scores", {}).get("technical"),
+                "Quality Score": rec.get("scores", {}).get("quality"),
+                "Value Score": rec.get("scores", {}).get("value"),
+                "Growth Score": rec.get("scores", {}).get("growth"),
+                "Entry Low": rec.get("entry_zone", (None, None))[0],
+                "Entry High": rec.get("entry_zone", (None, None))[1],
+                "Stop Loss": rec.get("stop_loss"),
+                "Target Fib": rec.get("targets", {}).get("fib"),
+                "Target Analyst": rec.get("targets", {}).get("analyst_mean"),
+                "Target DCF": rec.get("targets", {}).get("dcf"),
+                "Bull Case": " | ".join(rec.get("bull_case", [])),
+                "Bear Case": " | ".join(rec.get("bear_case", [])),
+            })
+
+        pd.DataFrame(rows_summary).to_excel(writer, sheet_name="Summary",        index=False)
+        pd.DataFrame(rows_val).to_excel(writer,     sheet_name="Valuation",      index=False)
+        pd.DataFrame(rows_q).to_excel(writer,       sheet_name="Quality",        index=False)
+        pd.DataFrame(rows_g).to_excel(writer,       sheet_name="Growth",         index=False)
+        pd.DataFrame(rows_o).to_excel(writer,       sheet_name="Ownership",      index=False)
+        pd.DataFrame(rows_rec).to_excel(writer,     sheet_name="Recommendation", index=False)
+
+        # Per-stock vertical sheets (cap 25)
+        for _, t_row in shortlist_df.head(25).iterrows():
+            ticker_no = t_row["Ticker"]
+            yf_sym = f"{ticker_no}.NS"
+            payload = fund_map.get(yf_sym) or {}
+            m   = payload.get("metrics", payload) if isinstance(payload, dict) else {}
+            rec = payload.get("recommendation") if isinstance(payload, dict) else None
+            if rec is None:
+                rec = recommend_action(m, t_row.to_dict())
+            sheet_rows = list(_flatten_metrics(ticker_no, m, t_row.to_dict(), rec).items())
+            sheet_rows.append(("Bull Case", " | ".join(rec.get("bull_case", []))))
+            sheet_rows.append(("Bear Case", " | ".join(rec.get("bear_case", []))))
+            df_sheet = pd.DataFrame(sheet_rows, columns=["Metric", "Value"])
+            # Excel sheet names ≤31 chars, no special chars
+            sn = re.sub(r"[^A-Za-z0-9_]", "_", ticker_no)[:28]
+            df_sheet.to_excel(writer, sheet_name=sn, index=False)
+
+    return buf.getvalue()
 
 # =============================
 # LIVE MARKET SNAPSHOT — fetch current Nifty, Sensex, INR from yfinance
@@ -610,7 +1600,7 @@ def get_live_market_snapshot() -> str:
 # =============================
 
 def get_raw_news() -> str:
-    today = datetime.now().strftime("%d %B %Y")
+    today = now_ist().strftime("%d %B %Y")
     query = (
         f"India stock market Nifty Sensex {today} RBI interest rate FII DII flows "
         f"Brent crude oil INR USD rupee NSE BSE "
@@ -639,7 +1629,7 @@ def generate_intel_summary(raw_news: str, live_snapshot: str) -> str:
         "for current index levels and prices — never contradict it. Supplement with news context. "
         "Be specific with numbers. Do not reproduce headlines."
     )
-    prompt = f"""Today: {datetime.now().strftime('%d %B %Y, %H:%M IST')}
+    prompt = f"""Today: {now_ist().strftime('%d %B %Y, %H:%M IST')}
 
 LIVE MARKET DATA (current prices as of now — use these exact numbers):
 {live_snapshot}
@@ -765,7 +1755,7 @@ def generate_strategy(
 
     system = "NSE equity analyst. Cite both technical AND macro reason per pick. Only use tickers from STOCKS. TOP 3 ≠ AVOID."
 
-    prompt = f"""{datetime.now().strftime('%d %b %Y')}
+    prompt = f"""{now_ist().strftime('%d %b %Y')}
 MACRO:{macro_facts}
 ETF DATA (for ETF RADAR section only — DO NOT pick these as stocks):{etf_short}
 SECTORS:{sector_short}
@@ -797,7 +1787,7 @@ One ticker per row, exactly 3 rows.
         return result
 
     # Retry with absolute minimum prompt
-    mini = f"""{datetime.now().strftime('%d %b %Y')}
+    mini = f"""{now_ist().strftime('%d %b %Y')}
 MACRO:{macro_facts[:300]}
 STOCK SCAN (picks must come ONLY from here, no ETFs):{stocks_short[:400]}
 Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN only. **AVOID** 2 bullets."""
@@ -810,38 +1800,20 @@ Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN o
 
 def best_upside_picks(df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
     """
-    Score by composite: upside% × vol_ratio × signal_weight × rsi_health
-    This prevents tiny micro-caps with inflated % targets dominating just
-    because of high upside%, while still allowing any price range.
+    Top N by composite Score (built in compute_composite_score). Excludes
+    RSI > RSI_OVERBOUGHT and Stage 4 (extended). Falls back to all rows if
+    everything is filtered out.
     """
     if df.empty:
         return pd.DataFrame()
     d = df.copy()
-
-    # Only exclude truly overbought
-    d = d[d["RSI"] <= RSI_OVERBOUGHT] if "RSI" in d.columns else d
-    if d.empty:
-        d = df.copy()
-
-    # Signal weight: Breakout > Building
-    d["_sig_w"]  = d["Signal"].map({"Breakout": 1.4, "Building": 1.0}).fillna(1.0)
-
-    # RSI health: prefer 40–65 range
-    def rsi_score(r):
-        if 40 <= r <= 65:  return 1.3
-        if 30 <= r < 40:   return 1.0
-        if 65 < r <= 72:   return 0.8
-        return 0.6
-    d["_rsi_w"]  = d["RSI"].apply(rsi_score) if "RSI" in d.columns else 1.0
-
-    # Volume weight: capped at 3x so extreme spikes don't dominate
-    d["_vol_w"]  = d["Vol Ratio"].clip(upper=3.0) if "Vol Ratio" in d.columns else 1.0
-
-    # Composite score
-    d["_score"]  = d["Upside %"] * d["_sig_w"] * d["_rsi_w"] * d["_vol_w"]
-
+    if "Score" not in d.columns:
+        d = compute_composite_score(d)
+    candidates = d[(d.get("RSI", 0) <= RSI_OVERBOUGHT) & (d.get("StageId", 0) != 4)]
+    if candidates.empty:
+        candidates = d
     return (
-        d.nlargest(n, "_score")[["Ticker","Price ₹","Target ₹","Upside %","Signal","RSI"]]
+        candidates.nlargest(n, "Score")[["Ticker", "Price ₹", "Target ₹", "Upside %", "Signal", "RSI", "Stage", "Score"]]
         .reset_index(drop=True)
     )
 
@@ -855,26 +1827,27 @@ with col_btn:
 with col_note:
     st.markdown(
         "<small style='color:#4a5578;font-family:JetBrains Mono,monospace;font-size:0.7rem'>"
-        "~2,000 NSE EQ stocks &nbsp;·&nbsp; ETF live data &nbsp;·&nbsp; "
-        "AI news + strategy &nbsp;·&nbsp; ~5–7 min"
+        "~2,000 NSE EQ stocks &nbsp;·&nbsp; 4-stage rally classifier &nbsp;·&nbsp; "
+        "FMP-style fundamentals on shortlist &nbsp;·&nbsp; AI strategy &nbsp;·&nbsp; ~6–8 min"
         "</small>",
         unsafe_allow_html=True,
     )
 
 if run:
     if "last_run" in st.session_state:
-        elapsed = (datetime.now() - st.session_state["last_run"]).seconds
+        elapsed = (now_ist() - st.session_state["last_run"]).total_seconds()
         if elapsed < 120:
-            st.warning(f"⏳ Please wait {120 - elapsed}s before re-running.")
+            st.warning(f"⏳ Please wait {int(120 - elapsed)}s before re-running.")
             st.stop()
 
-    st.session_state["last_run"] = datetime.now()
+    st.session_state["last_run"] = now_ist()
+    t_phase1 = time.perf_counter()
 
     # ── Phase 1: Data collection ──────────────────────────────────────
     st.markdown(
         "<span style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
         "color:#4a5578;letter-spacing:0.12em;text-transform:uppercase'>"
-        "Phase 1 &nbsp;·&nbsp; Market Data</span>",
+        "Phase 1 &nbsp;·&nbsp; Market Data &amp; Rally Scan</span>",
         unsafe_allow_html=True,
     )
 
@@ -882,12 +1855,13 @@ if run:
     _eq_status = st.empty()
     _eq_status.markdown(
         "<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-        "Loading equity list …</span>", unsafe_allow_html=True
+        "Loading equity list &amp; Nifty benchmark …</span>", unsafe_allow_html=True
     )
     registry = get_nse_registry()
     if registry.empty:
         st.error("Could not load NSE registry.")
         st.stop()
+    nifty_close = get_nifty_close()
     _eq_status.empty()
 
     # ETF registry + live scan with separate progress
@@ -904,18 +1878,26 @@ if run:
     n_eq_total   = len(eq_symbols)
     _eq_counter  = st.empty()
     _eq_pbar     = st.progress(0)
-    momentum_df  = scan_market(eq_symbols, _eq_counter, _eq_pbar)
+    momentum_df  = scan_market(eq_symbols, _eq_counter, _eq_pbar, nifty_close=nifty_close)
     _eq_counter.empty()
     _eq_pbar.empty()
 
+    # Build shortlist for deep-dive
+    shortlist_df = build_shortlist(momentum_df)
+    early_rally_df = momentum_df[momentum_df["StageId"].isin([1, 2])].sort_values("Score", ascending=False) if not momentum_df.empty else pd.DataFrame()
+
     # Print summary counts
     n_etfs_clean = len(etf_df) if not etf_df.empty else 0
+    elapsed_p1 = time.perf_counter() - t_phase1
     st.markdown(
         f"<div style='font-family:JetBrains Mono,monospace;font-size:0.74rem;"
-        f"color:#8896b3;display:flex;gap:28px;padding:6px 0 10px'>"
+        f"color:#8896b3;display:flex;gap:20px;padding:6px 0 10px;flex-wrap:wrap'>"
         f"<span>⬡ <strong style='color:#d4a843'>{n_eq_total:,}</strong> equities</span>"
         f"<span>◈ <strong style='color:#00c896'>{n_etfs_clean}</strong> ETFs</span>"
-        f"<span>▲ <strong style='color:#f0c96a'>{len(momentum_df)}</strong> momentum signals</span>"
+        f"<span>▲ <strong style='color:#f0c96a'>{len(momentum_df)}</strong> signals</span>"
+        f"<span>⚡ <strong style='color:#4f8ef7'>{len(early_rally_df)}</strong> early rally</span>"
+        f"<span>★ <strong style='color:#d4a843'>{len(shortlist_df)}</strong> shortlist</span>"
+        f"<span>⏱ Phase 1 in <strong>{elapsed_p1:.1f}s</strong></span>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -946,7 +1928,7 @@ if run:
     _ai("Analysing market intelligence …", 40)
     intel_summary = generate_intel_summary(raw_news, live_snapshot)
 
-    _ai("Building strategy brief …", 70)
+    _ai("Building strategy brief …", 65)
     momentum_context = build_momentum_context(momentum_df)
     sector_df        = build_sector_heatmap(momentum_df)
     sector_context   = build_sector_context(sector_df)
@@ -958,12 +1940,46 @@ if run:
     _ai_status.empty()
     _ai_pbar.empty()
 
+    # ── Phase 3: Deep-Dive Fundamentals (parallel) ────────────────────
+    st.markdown(
+        "<span style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
+        "color:#4a5578;letter-spacing:0.12em;text-transform:uppercase'>"
+        "Phase 3 &nbsp;·&nbsp; FMP-Style Fundamentals (Shortlist)</span>",
+        unsafe_allow_html=True,
+    )
+    _f_status = st.empty()
+    _f_pbar   = st.progress(0)
+    t_phase3 = time.perf_counter()
+    fund_map: dict = {}
+    if not shortlist_df.empty:
+        sl_symbols = [f"{t}.NS" for t in shortlist_df["Ticker"].tolist()]
+        raw_funds  = fetch_fundamentals_bulk(sl_symbols, _f_status, _f_pbar)
+        # Build {sym: {metrics, technicals, recommendation}}
+        for _, t_row in shortlist_df.iterrows():
+            sym  = f"{t_row['Ticker']}.NS"
+            m    = raw_funds.get(sym, {})
+            tech = t_row.to_dict()
+            try:
+                rec = recommend_action(m, tech)
+            except Exception as e:
+                rec = {"action": "HOLD", "conviction": 0, "scores": {},
+                       "bull_case": [f"Recommender error: {e}"], "bear_case": [],
+                       "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+            fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
+    _f_status.empty()
+    _f_pbar.empty()
+    elapsed_p3 = time.perf_counter() - t_phase3
+    st.caption(f"Deep dive fetched for {len(fund_map)} stocks in {elapsed_p3:.1f}s.")
+
     st.session_state.update({
-        "momentum_df"  : momentum_df,
-        "sector_df"    : sector_df,
-        "etf_df"       : etf_df,
-        "intel_summary": intel_summary,
-        "strategy"     : strategy,
+        "momentum_df"   : momentum_df,
+        "shortlist_df"  : shortlist_df,
+        "early_rally_df": early_rally_df,
+        "sector_df"     : sector_df,
+        "etf_df"        : etf_df,
+        "fund_map"      : fund_map,
+        "intel_summary" : intel_summary,
+        "strategy"      : strategy,
     })
 
 # =============================
@@ -971,89 +1987,400 @@ if run:
 # =============================
 
 if "strategy" in st.session_state:
-    momentum_df   = st.session_state["momentum_df"]
-    intel_summary = st.session_state.get("intel_summary", "")
-    strategy      = st.session_state["strategy"]
-    etf_df        = st.session_state.get("etf_df", pd.DataFrame())
+    momentum_df    = st.session_state["momentum_df"]
+    shortlist_df   = st.session_state.get("shortlist_df", pd.DataFrame())
+    early_rally_df = st.session_state.get("early_rally_df", pd.DataFrame())
+    sector_df_st   = st.session_state.get("sector_df", pd.DataFrame())
+    fund_map       = st.session_state.get("fund_map", {})
+    intel_summary  = st.session_state.get("intel_summary", "")
+    strategy       = st.session_state["strategy"]
+    etf_df         = st.session_state.get("etf_df", pd.DataFrame())
 
-    # ── KPI Row ──
+    # ── KPI Row (global, above tabs) ──
     if not momentum_df.empty:
-        k1, k2, k3, k4 = st.columns(4)
-        breakouts = int((momentum_df["Signal"] == "Breakout").sum())
-        building  = int((momentum_df["Signal"] == "Building").sum())
-        k1.metric("Momentum Stocks",   f"{len(momentum_df)}")
-        k2.metric("Breakouts",         f"{breakouts}", f"+{building} building")
-        k3.metric("Avg Upside Target", f"{momentum_df['Upside %'].mean():.1f}%")
-        k4.metric("Best Upside Found", f"{momentum_df['Upside %'].max():.1f}%")
+        k1, k2, k3, k4, k5 = st.columns(5)
+        breakouts = int((momentum_df["StageId"] == 3).sum())
+        early     = int(momentum_df["StageId"].isin([1, 2]).sum())
+        avg_score = float(momentum_df["Score"].mean())
+        k1.metric("Signals",          f"{len(momentum_df)}")
+        k2.metric("Early Rally",      f"{early}", f"+{int((momentum_df['StageId']==2).sum())} stage 2")
+        k3.metric("Breakouts",        f"{breakouts}")
+        k4.metric("Avg Composite",    f"{avg_score:.1f}")
+        k5.metric("Best Upside",      f"{momentum_df['Upside %'].max():.1f}%")
 
-    # ── Scanner Top Picks (pure technical — highest upside, RSI ≤ threshold) ──
-    if not momentum_df.empty:
-        st.markdown('<div class="section-header">Scanner · Highest Upside Potential</div>', unsafe_allow_html=True)
-        st.caption("Top 3 by upside % with RSI not overbought. AI Strategy Brief below makes its own picks using both technicals and macro/news — they may differ.")
-        top3 = best_upside_picks(momentum_df, n=3)
-        cols = st.columns(3)
-        for idx, (_, row) in enumerate(top3.iterrows()):
-            sig_cls = "sig-breakout" if row["Signal"] == "Breakout" else "sig-building"
-            with cols[idx]:
-                st.markdown(f"""
-                <div class="pick-card">
-                    <div class="ticker-name">{row['Ticker']}</div>
-                    <div class="ticker-meta">₹{row['Price ₹']} &nbsp;·&nbsp; RSI {row['RSI']}</div>
-                    <span class="upside-pill">▲ {row['Upside %']}%</span>
-                    <div class="target-row">Target &nbsp;<span class="target-price">₹{row['Target ₹']}</span></div>
-                    <div class="signal-tag {sig_cls}">{row['Signal'].upper()}</div>
-                </div>
-                """, unsafe_allow_html=True)
+    tab_scan, tab_early, tab_deep, tab_sector, tab_intel, tab_dl = st.tabs([
+        "Momentum Scan", "Early Rally", "Deep Dive", "Sector Heatmap", "Intel & Strategy", "Downloads",
+    ])
 
-    st.markdown("")
+    # =======================================================
+    # TAB 1 — MOMENTUM SCAN
+    # =======================================================
+    with tab_scan:
+        if not momentum_df.empty:
+            st.markdown('<div class="section-header">Top Composite Picks</div>', unsafe_allow_html=True)
+            st.caption("Top 3 by composite Score (stage + MACD + ADX + RS + RSI + upside). Excludes RSI overbought and Stage 4 extended.")
+            top3 = best_upside_picks(momentum_df, n=3)
+            cols = st.columns(3)
+            for idx, (_, row) in enumerate(top3.iterrows()):
+                sig_cls = "sig-breakout" if row["Signal"] == "Breakout" else "sig-building"
+                with cols[idx]:
+                    st.markdown(f"""
+                    <div class="pick-card">
+                        <div class="ticker-name">{row['Ticker']}</div>
+                        <div class="ticker-meta">₹{row['Price ₹']} &nbsp;·&nbsp; RSI {row['RSI']} &nbsp;·&nbsp; Stage: {row['Stage']}</div>
+                        <span class="upside-pill">▲ {row['Upside %']}% &nbsp; Score {row['Score']:.0f}</span>
+                        <div class="target-row">Target &nbsp;<span class="target-price">₹{row['Target ₹']}</span></div>
+                        <div class="signal-tag {sig_cls}">{row['Signal'].upper()}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-    # ── Strategy + Intelligence ──
-    col_l, col_r = st.columns([3, 2])
+            st.markdown('<div class="section-header">Full Momentum Candidates</div>', unsafe_allow_html=True)
 
-    with col_l:
-        st.markdown('<div class="section-header">AI Strategy Brief</div>', unsafe_allow_html=True)
-        if strategy:
-            st.markdown(f'<div class="strategy-wrap">\n\n{strategy}\n\n</div>', unsafe_allow_html=True)
+            def color_stage(val):
+                colors = {"Accumulation":"#4f8ef7","Early Markup":"#d4a843",
+                          "Breakout":"#00c896","Extended":"#f87171","—":"#4a5578"}
+                c = colors.get(val, "")
+                return f"color:{c};font-weight:700" if c else ""
+            def color_score(val):
+                if val >= 75: return "color:#00c896;font-weight:700"
+                if val >= 55: return "color:#d4a843;font-weight:600"
+                return ""
+            def color_upside(val):
+                if val >= 20: return "color:#00c896;font-weight:700"
+                if val >= 10: return "color:#d4a843"
+                return ""
+            def color_rsi_stock(val):
+                return "color:#f87171;font-weight:700" if val and val > RSI_OVERBOUGHT else ""
+
+            display_cols = [c for c in [
+                "Ticker","Price ₹","Stage","Score","Signal","RSI","Vol Ratio",
+                "ADX","MACD Hist","RS vs Nifty","ROC20 %","MA50","MA200",
+                "Dist MA50 %","Dist MA200 %","Target ₹","Upside %","52W High ₹","Gap to 52W %",
+            ] if c in momentum_df.columns]
+
+            fmt = {
+                "Price ₹":"₹{:.2f}","MA50":"₹{:.2f}","MA200":"₹{:.2f}","Target ₹":"₹{:.2f}",
+                "52W High ₹":"₹{:.2f}","RSI":"{:.1f}","Vol Ratio":"{:.2f}×",
+                "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%","ADX":"{:.1f}",
+                "MACD Hist":"{:.3f}","RS vs Nifty":"{:.2f}","ROC20 %":"{:+.1f}%",
+                "Dist MA50 %":"{:+.1f}%","Dist MA200 %":"{:+.1f}%","Score":"{:.1f}",
+            }
+            fmt = {k: v for k, v in fmt.items() if k in display_cols}
+
+            styler = momentum_df[display_cols].style.format(fmt, na_rep="N/A")
+            if "Stage"    in display_cols: styler = styler.applymap(color_stage,      subset=["Stage"])
+            if "Score"    in display_cols: styler = styler.applymap(color_score,      subset=["Score"])
+            if "Upside %" in display_cols: styler = styler.applymap(color_upside,     subset=["Upside %"])
+            if "RSI"      in display_cols: styler = styler.applymap(color_rsi_stock,  subset=["RSI"])
+
+            st.dataframe(styler, use_container_width=True, height=520)
+            st.caption(f"All {len(momentum_df)} signals · ranked by composite Score. Stage 4 rows are kept but down-weighted.")
         else:
-            st.warning("⚠ Strategy brief could not be generated. Check the AI Debug Log below. The market intelligence and scan results are still available.")
+            st.info("No momentum candidates found in this scan.")
 
-    with col_r:
-        st.markdown('<div class="section-header">Market Intelligence</div>', unsafe_allow_html=True)
-        scan_time = st.session_state["last_run"].strftime("%d %b %Y · %H:%M IST")
-        st.markdown(
-            f'<div class="intel-wrap">'
-            f'<div class="intel-scan-time">AI Analysis &nbsp;·&nbsp; {scan_time}</div>'
-            f'\n\n{intel_summary if intel_summary else ""}\n\n'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    # =======================================================
+    # TAB 2 — EARLY RALLY
+    # =======================================================
+    with tab_early:
+        st.markdown('<div class="section-header">Early Rally Radar · Stage 1 + 2</div>', unsafe_allow_html=True)
+        st.caption("Stocks set up BEFORE the breakout. Stage 1 = accumulation (squeeze, OBV rising). Stage 2 = early markup (MACD up, ADX rising, above MA50>MA200).")
+        if early_rally_df is None or early_rally_df.empty:
+            st.info("No Stage 1 or Stage 2 setups detected in this scan.")
+        else:
+            # Card grid, 3 per row
+            rows = early_rally_df.head(18).to_dict("records")
+            for i in range(0, len(rows), 3):
+                cols = st.columns(3)
+                for j, row in enumerate(rows[i:i + 3]):
+                    stage_color = "#4f8ef7" if row["StageId"] == 1 else "#d4a843"
+                    why = []
+                    if row.get("ADX") and row["ADX"] >= 18:               why.append(f"ADX {row['ADX']:.0f}")
+                    if row.get("MACD Hist") and row["MACD Hist"] > 0:     why.append("MACD bullish")
+                    if row.get("RS vs Nifty") and row["RS vs Nifty"] > 1: why.append(f"RS {row['RS vs Nifty']:.2f}")
+                    if row.get("Vol Ratio") and row["Vol Ratio"] > 1.2:   why.append(f"Vol {row['Vol Ratio']:.1f}×")
+                    why_text = " · ".join(why) if why else "Setup forming"
+                    with cols[j]:
+                        st.markdown(f"""
+                        <div class="pick-card" style="border-left:2px solid {stage_color};">
+                            <div class="ticker-name">{row['Ticker']}</div>
+                            <div class="ticker-meta">₹{row['Price ₹']} &nbsp;·&nbsp; RSI {row['RSI']} &nbsp;·&nbsp;
+                                <span style="color:{stage_color};font-weight:700">Stage {row['StageId']} · {row['Stage']}</span>
+                            </div>
+                            <span class="upside-pill">Score {row['Score']:.0f} &nbsp; ▲ {row['Upside %']}%</span>
+                            <div class="target-row" style="margin-top:10px;font-size:0.74rem;color:#8896b3">
+                                {why_text}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+            st.caption(f"{len(early_rally_df)} early-stage setups detected. Sorted by composite Score.")
 
-    # ── Full Momentum Table ──
-    st.markdown('<div class="section-header">Full Momentum Candidates</div>', unsafe_allow_html=True)
-    if not momentum_df.empty:
-        def color_signal(val):
-            return "color:#00c896;font-weight:700" if val == "Breakout" else "color:#f59e0b;font-weight:600"
-        def color_upside(val):
-            if val >= 20: return "color:#00c896;font-weight:700"
-            if val >= 10: return "color:#d4a843"
-            return ""
-        def color_rsi_stock(val):
-            return "color:#f87171;font-weight:700" if val > RSI_OVERBOUGHT else ""
-        st.dataframe(
-            momentum_df.style
-                .applymap(color_signal,     subset=["Signal"])
-                .applymap(color_upside,     subset=["Upside %"])
-                .applymap(color_rsi_stock,  subset=["RSI"])
-                .format({
-                    "Price ₹":"₹{:.2f}","MA50":"₹{:.2f}","Target ₹":"₹{:.2f}",
-                    "52W High ₹":"₹{:.2f}","RSI":"{:.1f}","Vol Ratio":"{:.2f}×",
-                    "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%",
+    # =======================================================
+    # TAB 3 — DEEP DIVE
+    # =======================================================
+    with tab_deep:
+        st.markdown('<div class="section-header">Per-Stock Deep Dive · Fundamentals + Recommendation</div>', unsafe_allow_html=True)
+        if shortlist_df is None or shortlist_df.empty:
+            st.info("No shortlist available. Run the scan to generate a shortlist of top-scored stocks.")
+        else:
+            if len(shortlist_df) <= SHORTLIST_FLOOR:
+                st.warning(f"Only {len(shortlist_df)} stocks passed the score threshold ({SHORTLIST_MIN_SCORE}). Showing the top {len(shortlist_df)} by score.")
+            tickers = shortlist_df["Ticker"].tolist()
+            selected_ticker = st.selectbox("Select a shortlisted stock", tickers, key="deepdive_ticker")
+            yf_sym = f"{selected_ticker}.NS"
+            payload = fund_map.get(yf_sym, {})
+            m   = payload.get("metrics", {}) if payload else {}
+            rec = payload.get("recommendation", {}) if payload else {}
+            tech_row = shortlist_df[shortlist_df["Ticker"] == selected_ticker].iloc[0].to_dict()
+
+            # Header strip
+            hcol1, hcol2, hcol3, hcol4 = st.columns([2, 1, 1, 1])
+            hcol1.markdown(
+                f"<div class='ticker-name'>{selected_ticker}</div>"
+                f"<div class='ticker-meta'>{m.get('name','')} &nbsp;·&nbsp; "
+                f"{m.get('sector') or '—'} / {m.get('industry') or '—'}</div>",
+                unsafe_allow_html=True,
+            )
+            hcol2.metric("Price ₹", _num(tech_row.get("Price ₹")))
+            hcol3.metric("Stage", tech_row.get("Stage", "—"))
+            hcol4.metric("Score", _num(tech_row.get("Score"), decimals=1))
+
+            # Recommendation card
+            action = rec.get("action", "—")
+            color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
+                         "HOLD":"#8896b3","AVOID":"#f87171"}
+            ac_color = color_map.get(action, "#8896b3")
+            st.markdown(f"""
+            <div class="pick-card" style="margin-top:10px;border-left:3px solid {ac_color}">
+                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+                    <span class="upside-pill" style="background:{ac_color};color:#0a0a0a;font-size:0.95rem;padding:6px 18px">
+                        {action.replace('_',' ')}
+                    </span>
+                    <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                        Conviction <strong style="color:#f0c96a;font-size:1.1rem">{rec.get('conviction','—')}</strong> / 100
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            if rec.get("conviction") is not None:
+                st.progress(min(int(rec["conviction"]), 100))
+
+            scores = rec.get("scores", {})
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Tech",    f"{scores.get('technical','—')}")
+            sc2.metric("Quality", f"{scores.get('quality','—')}")
+            sc3.metric("Value",   f"{scores.get('value','—')}")
+            sc4.metric("Growth",  f"{scores.get('growth','—')}")
+
+            # Sub-tabs for fundamentals
+            stab_v, stab_q, stab_g, stab_o, stab_th = st.tabs(
+                ["Valuation", "Quality", "Growth", "Ownership", "Bull/Bear & Targets"]
+            )
+
+            with stab_v:
+                dcf = m.get("dcf") or {}
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric("P/E trailing", _num(m.get("pe_trailing")))
+                v2.metric("P/E forward",  _num(m.get("pe_forward")))
+                v3.metric("P/B",          _num(m.get("pb")))
+                v4.metric("EV/EBITDA",    _num(m.get("ev_ebitda")))
+                v5, v6, v7, v8 = st.columns(4)
+                v5.metric("PEG",          _num(m.get("peg")))
+                v6.metric("P/S",          _num(m.get("price_to_sales")))
+                v7.metric("Div Yield",    _pct(m.get("dividend_yield")))
+                v8.metric("DCF Intrinsic ₹", _num(dcf.get("intrinsic_per_share")))
+                d1, d2, d3 = st.columns(3)
+                d1.metric("DCF Upside %", _num(dcf.get("upside_pct"), suffix="%"))
+                d2.metric("DCF Confidence", dcf.get("confidence", "—"))
+                a = dcf.get("assumptions", {})
+                d3.metric("Growth used", _pct(a.get("growth")) if a else "—")
+                if a:
+                    st.caption(
+                        f"DCF: 5y FCF @ growth {_pct(a.get('growth'))} · discount {_pct(a.get('discount_rate'))} · "
+                        f"terminal {_pct(a.get('terminal_growth'))} · history {a.get('fcf_history_years','—')}y"
+                    )
+
+            with stab_q:
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("ROE",   _pct(m.get("roe")))
+                q2.metric("ROCE",  _pct(m.get("roce")))
+                q3.metric("ROIC",  _pct(m.get("roic")))
+                q4.metric("ROA",   _pct(m.get("roa")))
+                q5, q6, q7, q8 = st.columns(4)
+                q5.metric("Gross Margin", _pct(m.get("gross_margin")))
+                q6.metric("Op Margin",    _pct(m.get("op_margin")))
+                q7.metric("Net Margin",   _pct(m.get("net_margin")))
+                q8.metric("D/E",          _num(m.get("debt_to_equity")))
+                q9, q10, q11, _ = st.columns(4)
+                q9.metric("Interest Cov", _num(m.get("interest_coverage"), suffix="×"))
+                q10.metric("Current Ratio", _num(m.get("current_ratio")))
+                q11.metric("Quick Ratio",   _num(m.get("quick_ratio")))
+
+            with stab_g:
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("Rev CAGR 3Y",   _pct(m.get("rev_cagr_3y")))
+                g2.metric("Rev CAGR 5Y",   _pct(m.get("rev_cagr_5y")))
+                g3.metric("EPS CAGR 3Y",   _pct(m.get("eps_cagr_3y")))
+                g4.metric("Fwd EPS Growth", _pct(m.get("fwd_eps_growth")))
+                g5, g6, g7, _ = st.columns(4)
+                g5.metric("Revenue Growth (TTM)",  _pct(m.get("revenue_growth")))
+                g6.metric("Earnings Growth (TTM)", _pct(m.get("earnings_growth")))
+                g7.metric("Avg Earnings Surprise", _num(m.get("earnings_surprise_avg"), suffix="%"))
+
+            with stab_o:
+                o1, o2, o3, o4 = st.columns(4)
+                o1.metric("Insider Held",       _pct(m.get("insider_held")))
+                o2.metric("Institutional Held", _pct(m.get("institutional_held")))
+                o3.metric("Analyst Rec",        m.get("recommendation_key") or "—")
+                o4.metric("Analyst Count",      _num(m.get("analyst_count"), decimals=0))
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Analyst Target Mean ₹", _num(m.get("target_mean")))
+                t2.metric("Analyst Target High ₹", _num(m.get("target_high")))
+                t3.metric("Analyst Target Low ₹",  _num(m.get("target_low")))
+                hl = m.get("news_headlines") or []
+                if hl:
+                    st.markdown("**Recent news headlines:**")
+                    for h in hl:
+                        st.markdown(f"- {h}")
+
+            with stab_th:
+                b1, b2 = st.columns(2)
+                with b1:
+                    st.markdown("**Bull case**")
+                    for b in rec.get("bull_case", []):
+                        st.markdown(f"- {b}")
+                with b2:
+                    st.markdown("**Bear case**")
+                    for b in rec.get("bear_case", []):
+                        st.markdown(f"- {b}")
+                ez = rec.get("entry_zone", (None, None))
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
+                e2.metric("Stop Loss ₹",  _num(rec.get("stop_loss")))
+                tgts = rec.get("targets", {})
+                first_tgt = next(iter(tgts.values()), None) if tgts else None
+                e3.metric("Targets count", f"{len(tgts)}")
+                if tgts:
+                    tdf = pd.DataFrame(
+                        [(k, v, ((v / tech_row.get("Price ₹") - 1) * 100 if tech_row.get("Price ₹") else None))
+                         for k, v in tgts.items()],
+                        columns=["Source", "Target ₹", "Upside %"],
+                    ).sort_values("Target ₹")
+                    st.dataframe(
+                        tdf.style.format({"Target ₹": "₹{:.2f}", "Upside %": "{:+.1f}%"}, na_rep="—"),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                if st.button("Generate AI thesis for this stock", key=f"ai_thesis_{selected_ticker}"):
+                    sys = "NSE equity analyst. 4 sentences max. Cite numbers."
+                    prompt_th = (
+                        f"{selected_ticker} ({m.get('name','')}): price ₹{tech_row.get('Price ₹')}, "
+                        f"Stage {tech_row.get('Stage')}, RSI {tech_row.get('RSI')}, ADX {tech_row.get('ADX')}, "
+                        f"RS {tech_row.get('RS vs Nifty')}. ROE { _pct(m.get('roe')) }, "
+                        f"Op margin { _pct(m.get('op_margin')) }, P/E fwd { _num(m.get('pe_forward')) }, "
+                        f"DCF upside { _num((m.get('dcf') or {}).get('upside_pct'), suffix='%') }. "
+                        f"Action: {rec.get('action')}, conviction {rec.get('conviction')}. "
+                        f"Write a 4-sentence investment thesis covering: 1) setup, 2) fundamentals, "
+                        f"3) valuation, 4) primary risk."
+                    )
+                    with st.spinner("Drafting thesis …"):
+                        thesis = call_ai(prompt_th, system=sys, max_tokens=600)
+                    if thesis:
+                        st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
+                    else:
+                        st.warning("Thesis unavailable (AI call failed). Check Debug Log.")
+
+    # =======================================================
+    # TAB 4 — SECTOR HEATMAP
+    # =======================================================
+    with tab_sector:
+        st.markdown('<div class="section-header">Sector Heatmap</div>', unsafe_allow_html=True)
+        if sector_df_st is None or sector_df_st.empty:
+            st.info("No mapped-sector data available from this scan.")
+        else:
+            def color_avg_up(val):
+                if val is None or not np.isfinite(val): return ""
+                if val >= 20: return "color:#00c896;font-weight:700"
+                if val >= 10: return "color:#d4a843"
+                return ""
+            st.dataframe(
+                sector_df_st.style
+                    .applymap(color_avg_up, subset=["Avg Upside %"])
+                    .format({"Avg Upside %": "+{:.1f}%"}),
+                use_container_width=True, height=460,
+            )
+
+    # =======================================================
+    # TAB 5 — INTEL & STRATEGY
+    # =======================================================
+    with tab_intel:
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown('<div class="section-header">AI Strategy Brief</div>', unsafe_allow_html=True)
+            if strategy:
+                st.markdown(f'<div class="strategy-wrap">\n\n{strategy}\n\n</div>', unsafe_allow_html=True)
+            else:
+                st.warning("⚠ Strategy brief could not be generated. Check the AI Debug Log below.")
+        with col_r:
+            st.markdown('<div class="section-header">Market Intelligence</div>', unsafe_allow_html=True)
+            scan_time = st.session_state["last_run"].strftime("%d %b %Y · %H:%M IST")
+            st.markdown(
+                f'<div class="intel-wrap">'
+                f'<div class="intel-scan-time">AI Analysis &nbsp;·&nbsp; {scan_time}</div>'
+                f'\n\n{intel_summary if intel_summary else ""}\n\n'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # =======================================================
+    # TAB 6 — DOWNLOADS
+    # =======================================================
+    with tab_dl:
+        st.markdown('<div class="section-header">Downloads</div>', unsafe_allow_html=True)
+        stamp = st.session_state["last_run"].strftime("%Y%m%d_%H%M_IST")
+
+        d1, d2 = st.columns(2)
+        with d1:
+            st.markdown("**Full scan (CSV)**")
+            st.caption(f"All {len(momentum_df)} momentum signals with all indicators and Score.")
+            if not momentum_df.empty:
+                st.download_button(
+                    label="⬇ Download full scan CSV",
+                    data=momentum_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"nse_scan_{stamp}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Nothing to download yet.")
+
+        with d2:
+            st.markdown("**Shortlist deep-dive (Excel)**")
+            st.caption(f"{len(shortlist_df)} stocks — Summary, Valuation, Quality, Growth, Ownership, Recommendation + per-stock sheets.")
+            if shortlist_df is not None and not shortlist_df.empty:
+                try:
+                    xlsx_bytes = build_excel_workbook(momentum_df, shortlist_df, fund_map)
+                    st.download_button(
+                        label="⬇ Download deep-dive XLSX",
+                        data=xlsx_bytes,
+                        file_name=f"nse_deepdive_{stamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"Excel build failed: {e}")
+            else:
+                st.info("Run scan first.")
+
+        if not shortlist_df.empty:
+            st.markdown('<div class="section-header" style="margin-top:30px">Shortlist preview</div>', unsafe_allow_html=True)
+            preview_cols = [c for c in ["Ticker","Price ₹","Stage","Score","RSI","ADX","RS vs Nifty","Upside %","Target ₹"] if c in shortlist_df.columns]
+            st.dataframe(
+                shortlist_df[preview_cols].style.format({
+                    "Price ₹":"₹{:.2f}","Target ₹":"₹{:.2f}","RSI":"{:.1f}",
+                    "ADX":"{:.1f}","RS vs Nifty":"{:.2f}","Score":"{:.1f}","Upside %":"+{:.1f}%",
                 }),
-            use_container_width=True, height=420,
-        )
-        st.caption(f"RSI > {RSI_OVERBOUGHT} highlighted red. All {len(momentum_df)} stocks above MA50 with breakout or volume signal.")
-    else:
-        st.info("No momentum candidates found in this scan.")
+                use_container_width=True, height=420,
+            )
 
     # ── Debug Log ──
     if st.session_state.get("ai_debug"):
@@ -1076,8 +2403,9 @@ else:
             Hit &nbsp;<strong style="color:#d4a843">Run Market Intelligence</strong>&nbsp; to begin
         </div>
         <div class="empty-sub">
-            ~2,000 NSE EQ stocks &nbsp;·&nbsp; ETF data &nbsp;·&nbsp; live prices &nbsp;·&nbsp;
-            AI strategy (technicals + news) &nbsp;·&nbsp; full momentum table
+            ~2,000 NSE EQ stocks &nbsp;·&nbsp; 4-stage rally detector &nbsp;·&nbsp;
+            FMP-style fundamentals &nbsp;·&nbsp; deep-dive recommendations &nbsp;·&nbsp;
+            CSV + Excel download
         </div>
     </div>
     """, unsafe_allow_html=True)
