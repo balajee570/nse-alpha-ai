@@ -376,28 +376,40 @@ SECTOR_MAP = {
     "NAVINFLUOR":"Chemicals","ATUL":"Chemicals",
 }
 
-# NSE sector indices — used by Sector Leadership Engine (Z2). Maps the
-# SECTOR_MAP sector names to their NSE index ticker on yfinance. Sectors
-# without a clean index (e.g. Defence, Railways — there's no single NSE
-# index for these themes) are intentionally absent; their member stocks
-# still get sector_in_top5=False by default until we add thematic baskets.
+# NSE sector indices — used by Sector Leadership Engine (Z2). One entry per
+# unique NSE index; compound display names cover sectors that share an
+# underlying index (Pharma+Healthcare both live in ^CNXPHARMA, Infra+CapGoods
+# both in ^CNXINFRA) so the leaderboard shows ONE row per unique index, not
+# duplicates. Telecom intentionally omitted — NSE has no clean Telecom index.
 SECTOR_INDICES = {
-    "Banking":     "^NSEBANK",
-    "Finance":     "^CNXFIN",
-    "IT":          "^CNXIT",
-    "Pharma":      "^CNXPHARMA",
-    "Healthcare":  "^CNXPHARMA",
-    "Auto":        "^CNXAUTO",
-    "Metals":      "^CNXMETAL",
-    "Energy":      "^CNXENERGY",
-    "FMCG":        "^CNXFMCG",
-    "Realty":      "^CNXREALTY",
-    "Media":       "^CNXMEDIA",
-    "Infra":       "^CNXINFRA",
-    "CapGoods":    "^CNXINFRA",
-    "Telecom":     "^CNXMEDIA",
-    # No clean index: Defence, Chemicals — surfaced via per-stock data only.
+    "Banking":             "^NSEBANK",
+    "Finance":             "^CNXFIN",
+    "IT":                  "^CNXIT",
+    "Pharma / Healthcare": "^CNXPHARMA",
+    "Auto":                "^CNXAUTO",
+    "Metals":              "^CNXMETAL",
+    "Energy":              "^CNXENERGY",
+    "FMCG":                "^CNXFMCG",
+    "Realty":              "^CNXREALTY",
+    "Media":               "^CNXMEDIA",
+    "Infra / Cap Goods":   "^CNXINFRA",
 }
+
+# Maps the simple per-stock sector names in SECTOR_MAP to the compound
+# display names used in SECTOR_INDICES, so breadth counts and top-5 lookups
+# agree on what counts as the same sector.
+SECTOR_DISPLAY_ALIAS = {
+    "Pharma":     "Pharma / Healthcare",
+    "Healthcare": "Pharma / Healthcare",
+    "Infra":      "Infra / Cap Goods",
+    "CapGoods":   "Infra / Cap Goods",
+}
+
+def _sector_display_name(raw: str | None) -> str | None:
+    """Translate a raw SECTOR_MAP sector to its display sector name."""
+    if not raw:
+        return raw
+    return SECTOR_DISPLAY_ALIAS.get(raw, raw)
 
 # =============================
 # PAGE CONFIG
@@ -1219,7 +1231,7 @@ def compute_sector_strength(scan_df: pd.DataFrame | None = None) -> pd.DataFrame
     breadth: dict = {}
     if scan_df is not None and not scan_df.empty and "Ticker" in scan_df.columns:
         for _, r in scan_df.iterrows():
-            sec = SECTOR_MAP.get(r["Ticker"])
+            sec = _sector_display_name(SECTOR_MAP.get(r["Ticker"]))
             if sec: breadth[sec] = breadth.get(sec, 0) + 1
 
     for sym, m in raw.items():
@@ -1742,19 +1754,19 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def attach_rs_rank(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Minervini-style cross-sectional RS_Rank (0-99) based on the
+    """Add Minervini-style cross-sectional RS Rank (0-99) based on the
     `RS vs Nifty` column. No-op when the column is missing or empty."""
     if df.empty or "RS vs Nifty" not in df.columns:
         return df
     d = df.copy()
     pct = d["RS vs Nifty"].rank(pct=True, na_option="bottom")
-    d["RS_Rank"] = (pct * 100).round(0).astype("Int64").fillna(50).astype(int)
+    d["RS Rank"] = (pct * 100).round(0).astype("Int64").fillna(50).astype(int)
     return d
 
 
 def attach_grade(df: pd.DataFrame, regime_label: str = "SELECTIVE",
                  top_sectors: set | None = None) -> pd.DataFrame:
-    """Compute Conviction Grade A+/A/B+/B/C using composite Score, RS_Rank,
+    """Compute Conviction Grade A+/A/B+/B/C using composite Score, RS Rank,
     sector position, pattern quality, regime, and stage."""
     if df.empty or "Score" not in df.columns:
         return df
@@ -1764,8 +1776,10 @@ def attach_grade(df: pd.DataFrame, regime_label: str = "SELECTIVE",
 
     d = df.copy()
     score_n   = (d["Score"].fillna(0) / 100).clip(0, 1)
-    rs_n      = (d.get("RS_Rank", pd.Series([50]*len(d), index=d.index)).fillna(50) / 100).clip(0, 1)
-    sec_n     = d["Ticker"].apply(lambda t: 1.0 if SECTOR_MAP.get(t) in top_sectors else 0.3)
+    rs_n      = (d.get("RS Rank", pd.Series([50]*len(d), index=d.index)).fillna(50) / 100).clip(0, 1)
+    sec_n     = d["Ticker"].apply(
+        lambda t: 1.0 if _sector_display_name(SECTOR_MAP.get(t)) in top_sectors else 0.3
+    )
     pat_n     = (d.get("Pattern Q", pd.Series([0]*len(d), index=d.index)).fillna(0) / 100).clip(0, 1)
     reg_n     = regime_w
     stg_n     = d.get("StageId", pd.Series([0]*len(d), index=d.index)).map(stage_w).fillna(0.5)
@@ -2200,8 +2214,8 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
               lambda: f"DCF upside {dcf_up:.1f}%"),
         _flag(lambda: stage_id in (1, 2),
               lambda: f"Stage {stage_id} setup ({STAGE_LABELS[stage_id]})"),
-        _flag(lambda: _gt(tech.get("RS_Rank"), 90),
-              lambda: f"RS Rank {int(tech['RS_Rank'])} (top decile)"),
+        _flag(lambda: _gt(tech.get("RS Rank"), 90),
+              lambda: f"RS Rank {int(tech['RS Rank'])} (top decile)"),
         _flag(lambda: _gt(tech.get("RS vs Nifty"), 1.1),
               lambda: f"RS vs Nifty {tech['RS vs Nifty']:.2f}"),
         _flag(lambda: _gt(metrics.get("institutional_held"), 0.40),
@@ -3156,7 +3170,7 @@ if "strategy" in st.session_state:
                 return "color:#f87171;font-weight:700" if val and val > RSI_OVERBOUGHT else ""
 
             display_cols = [c for c in [
-                "Ticker","Price ₹","Grade","Stage","Score","RS_Rank","Pattern","Pattern Q",
+                "Ticker","Price ₹","Grade","Stage","Score","RS Rank","Pattern","Pattern Q",
                 "Signal","RSI","Vol Ratio","ADX","MACD Hist","RS vs Nifty","ROC20 %",
                 "MA50","MA200","Dist MA50 %","Dist MA200 %","Target ₹","Upside %",
                 "52W High ₹","Gap to 52W %","New 52W High",
@@ -3168,7 +3182,7 @@ if "strategy" in st.session_state:
                 "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%","ADX":"{:.1f}",
                 "MACD Hist":"{:.3f}","RS vs Nifty":"{:.2f}","ROC20 %":"{:+.1f}%",
                 "Dist MA50 %":"{:+.1f}%","Dist MA200 %":"{:+.1f}%","Score":"{:.1f}",
-                "RS_Rank":"{:.0f}","Pattern Q":"{:.0f}",
+                "RS Rank":"{:.0f}","Pattern Q":"{:.0f}",
             }
             fmt = {k: v for k, v in fmt.items() if k in display_cols}
 
@@ -3193,11 +3207,11 @@ if "strategy" in st.session_state:
             if "RSI"      in display_cols: styler = styler.map(color_rsi_stock,  subset=["RSI"])
             if "Grade"    in display_cols: styler = styler.map(color_grade,      subset=["Grade"])
             if "Pattern"  in display_cols: styler = styler.map(color_pattern,    subset=["Pattern"])
-            if "RS_Rank"  in display_cols: styler = styler.map(color_rs_rank,    subset=["RS_Rank"])
+            if "RS Rank"  in display_cols: styler = styler.map(color_rs_rank,    subset=["RS Rank"])
 
             st.dataframe(styler, use_container_width=True, height=520)
             st.caption(f"All {len(momentum_df)} signals · ranked by composite Score. "
-                       f"Grade blends Score, RS_Rank, sector position, pattern quality, regime, and stage. "
+                       f"Grade blends Score, RS Rank, sector position, pattern quality, regime, and stage. "
                        f"Stage 4 rows are kept but down-weighted.")
         else:
             st.info("No momentum candidates found in this scan.")
@@ -3333,15 +3347,24 @@ if "strategy" in st.session_state:
                 if v >= 3:  return "color:#d4a843"
                 if v <= -5: return "color:#f87171;font-weight:700"
                 return ""
-            ss_styler = sector_strength.style.format({
+
+            # Reorder + drop the noisy Index column. Sector name is enough;
+            # the underlying NSE index ticker is implementation detail.
+            ss_cols = [c for c in [
+                "Sector", "Status", "Score", "1M %", "3M %", "6M %",
+                "Above 50DMA", "Above 200DMA", "Breadth",
+            ] if c in sector_strength.columns]
+            ss_view = sector_strength[ss_cols]
+
+            ss_styler = ss_view.style.format({
                 "1M %":"{:+.1f}%","3M %":"{:+.1f}%","6M %":"{:+.1f}%","Score":"{:.1f}",
             }, na_rep="—")
             for c in ("1M %", "3M %", "6M %"):
-                if c in sector_strength.columns:
+                if c in ss_cols:
                     ss_styler = ss_styler.map(color_ret, subset=[c])
-            if "Status" in sector_strength.columns:
+            if "Status" in ss_cols:
                 ss_styler = ss_styler.map(color_status, subset=["Status"])
-            st.dataframe(ss_styler, use_container_width=True, height=400)
+            st.dataframe(ss_styler, use_container_width=True, height=400, hide_index=True)
         else:
             st.info("Sector index data unavailable — check yfinance access.")
 
@@ -3358,7 +3381,7 @@ if "strategy" in st.session_state:
                 sector_df_st.style
                     .map(color_avg_up, subset=["Avg Upside %"])
                     .format({"Avg Upside %": "+{:.1f}%"}),
-                use_container_width=True, height=360,
+                use_container_width=True, height=360, hide_index=True,
             )
 
     # =======================================================
