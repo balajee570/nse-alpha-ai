@@ -1,8 +1,17 @@
 from __future__ import annotations
 import re
 import io
+import os
+import json
+import uuid
 import time
 import math
+import pickle
+import logging
+import warnings
+import threading
+import tempfile
+from pathlib import Path
 import streamlit as st
 import requests
 import pandas as pd
@@ -11,6 +20,12 @@ import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tavily import TavilyClient
+
+# Silence Streamlit warnings from the background thread that has no ScriptRunContext.
+warnings.filterwarnings("ignore", message=".*ScriptRunContext.*")
+warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
+warnings.filterwarnings("ignore", message=".*to view a Streamlit app.*")
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
 try:
     from zoneinfo import ZoneInfo
@@ -23,6 +38,195 @@ def now_ist() -> datetime:
 
 def fmt_ist(fmt: str = "%d %b %Y · %H:%M IST") -> str:
     return now_ist().strftime(fmt)
+
+# Yahoo Finance recently tightened crumb / Cloudflare checks, which causes
+# Ticker.info / .financials / .balance_sheet to fail with HTTP 401 "Invalid
+# Crumb" using the default requests session. curl_cffi impersonates a real
+# Chrome TLS fingerprint and bypasses the block.
+try:
+    from curl_cffi import requests as _cf_requests
+    YF_SESSION = _cf_requests.Session(impersonate="chrome")
+except Exception:
+    YF_SESSION = None
+
+def _yf_ticker(symbol: str):
+    """Return a yf.Ticker bound to the impersonating session when available."""
+    if YF_SESSION is not None:
+        try:
+            return yf.Ticker(symbol, session=YF_SESSION)
+        except Exception:
+            pass
+    return yf.Ticker(symbol)
+
+def _yf_download(*args, **kwargs):
+    """yf.download wrapper that passes the curl_cffi session when supported."""
+    if YF_SESSION is not None and "session" not in kwargs:
+        try:
+            return yf.download(*args, session=YF_SESSION, **kwargs)
+        except TypeError:
+            # yfinance version doesn't accept session=; fall through
+            pass
+    return yf.download(*args, **kwargs)
+
+# =============================
+# BACKGROUND JOB RUNNER
+# Lets the heavy pipeline (scan + AI + fundamentals) keep running even if
+# the user closes the tab. Status + result are persisted on disk so any
+# session that re-opens the page reattaches to the in-flight job.
+# Streamlit Cloud / `streamlit run` keeps the parent process alive long
+# enough for daemon=False threads to finish; on serverless runtimes that
+# scale to zero this WILL NOT survive.
+# =============================
+
+JOB_DIR     = Path(os.environ.get("NSE_JOB_DIR", "/tmp/nse_alpha_jobs"))
+JOB_STATUS  = JOB_DIR / "status.json"
+JOB_RESULT  = JOB_DIR / "result.pkl"
+JOB_LOCK    = JOB_DIR / "job.lock"
+JOB_HEARTBEAT_TIMEOUT = 600   # seconds; lock considered stale if updated_at older than this
+JOB_DIR.mkdir(parents=True, exist_ok=True)
+
+_AI_DEBUG_BUFFER: list = []   # filled by call_ai when session_state is unreachable
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try: os.remove(tmp)
+        except Exception: pass
+        raise
+
+def _write_status(d: dict) -> None:
+    try:
+        d = {**d, "updated_at": now_ist().isoformat()}
+        _atomic_write(JOB_STATUS, json.dumps(d, default=str).encode("utf-8"))
+    except Exception:
+        pass
+
+def _read_status() -> dict | None:
+    try:
+        if not JOB_STATUS.exists():
+            return None
+        return json.loads(JOB_STATUS.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _acquire_lock(job_id: str) -> None:
+    JOB_LOCK.write_text(json.dumps({"job_id": job_id, "started_at": now_ist().isoformat()}))
+
+def _release_lock() -> None:
+    try:
+        if JOB_LOCK.exists():
+            JOB_LOCK.unlink()
+    except Exception:
+        pass
+
+def _lock_age_seconds() -> float | None:
+    try:
+        lock = json.loads(JOB_LOCK.read_text(encoding="utf-8"))
+        started = datetime.fromisoformat(lock.get("started_at", ""))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=IST)
+        return (now_ist() - started).total_seconds()
+    except Exception:
+        return None
+
+def _job_alive() -> bool:
+    """True iff a lock exists AND (no status yet but lock is fresh, OR status updated within HEARTBEAT_TIMEOUT and not done)."""
+    if not JOB_LOCK.exists():
+        return False
+    status = _read_status()
+
+    # If status exists and signals completion, clear the lock and report not-alive.
+    if status and status.get("done"):
+        _release_lock()
+        return False
+
+    # No status file yet — give the thread up to 30 s to write its first heartbeat.
+    if not status:
+        age = _lock_age_seconds()
+        if age is None or age > 30:
+            _release_lock()
+            return False
+        return True
+
+    # Status present and not done: check heartbeat freshness.
+    try:
+        last = datetime.fromisoformat(status.get("updated_at", ""))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=IST)
+        age = (now_ist() - last).total_seconds()
+        if age > JOB_HEARTBEAT_TIMEOUT:
+            _release_lock()
+            return False
+    except Exception:
+        return False
+    return True
+
+def _save_result(payload: dict) -> None:
+    _atomic_write(JOB_RESULT, pickle.dumps(payload))
+
+def _load_result() -> dict | None:
+    try:
+        if not JOB_RESULT.exists():
+            return None
+        return pickle.loads(JOB_RESULT.read_bytes())
+    except Exception:
+        return None
+
+def _result_mtime() -> float:
+    try:
+        return JOB_RESULT.stat().st_mtime if JOB_RESULT.exists() else 0.0
+    except Exception:
+        return 0.0
+
+def _make_status_cb(job_id: str):
+    """Factory for a progress callback that writes JOB_STATUS atomically.
+    Signature: cb(phase: str, current: int, total: int, msg: str = "", done: bool = False)
+    """
+    started_at = now_ist().isoformat()
+    def cb(phase: str, current: int = 0, total: int = 100, msg: str = "", done: bool = False, error: str | None = None):
+        _write_status({
+            "job_id": job_id,
+            "phase":  phase,
+            "current": int(current) if current is not None else 0,
+            "total":   int(total) if total is not None else 0,
+            "msg":     msg,
+            "started_at": started_at,
+            "done":    bool(done),
+            "error":   error,
+        })
+    return cb
+
+def start_background_job() -> str:
+    """Spawn the background pipeline. Returns the new job_id.
+    Acquires the lock and writes the first status entry synchronously so the
+    UI can see _job_alive() == True immediately on the next rerun."""
+    job_id = uuid.uuid4().hex[:8]
+    _acquire_lock(job_id)
+    cb = _make_status_cb(job_id)
+    cb("startup", 0, 100, "Starting background scan")
+    t = threading.Thread(
+        target=_run_pipeline_bg, args=(job_id, cb),
+        daemon=False, name=f"nse-job-{job_id}",
+    )
+    t.start()
+    return job_id
+
+def _run_pipeline_bg(job_id: str, cb) -> None:
+    try:
+        result = _run_pipeline(cb)
+        _save_result(result)
+        cb("complete", 100, 100, "Scan complete", done=True)
+    except Exception as e:
+        cb("error", 0, 100, f"Job failed: {e}", done=True, error=str(e))
+    finally:
+        _release_lock()
+
+# Forward declaration — defined later once all pipeline functions exist.
+_run_pipeline = None  # type: ignore
 
 # =============================
 # API CONFIG
@@ -322,14 +526,22 @@ st.markdown(f"""
 def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
+def _record_ai_debug(entry: dict) -> None:
+    """Append AI call debug data to session_state, falling back to a module
+    buffer if there's no script_run_ctx (i.e. background thread)."""
+    try:
+        log = st.session_state.get("ai_debug", [])
+        log.append(entry)
+        st.session_state["ai_debug"] = log
+    except Exception:
+        _AI_DEBUG_BUFFER.append(entry)
+
 def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
     headers  = {"Authorization": f"Bearer {SARVAM_API_KEY}", "Content-Type": "application/json"}
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
-    debug_log = st.session_state.get("ai_debug", [])
 
     payload = {
         "model"      : "sarvam-105b",
@@ -341,9 +553,7 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
 
     try:
         r = requests.post(SARVAM_URL, headers=headers, json=payload, timeout=240)
-        entry = {"model": "sarvam-105b", "status": r.status_code, "body": r.text[:1200]}
-        debug_log.append(entry)
-        st.session_state["ai_debug"] = debug_log
+        _record_ai_debug({"model": "sarvam-105b", "status": r.status_code, "body": r.text[:1200]})
 
         if r.status_code == 200:
             choices = r.json().get("choices", [])
@@ -353,17 +563,19 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 6000) -> str:
                 if stripped:
                     return stripped
     except requests.exceptions.Timeout:
-        debug_log.append({"model": "sarvam-105b", "error": "Timed out after 240s"})
-        st.session_state["ai_debug"] = debug_log
+        _record_ai_debug({"model": "sarvam-105b", "error": "Timed out after 240s"})
     except Exception as e:
-        debug_log.append({"model": "sarvam-105b", "error": str(e)})
-        st.session_state["ai_debug"] = debug_log
+        _record_ai_debug({"model": "sarvam-105b", "error": str(e)})
 
     return ""
 
 # =============================
 # NSE REGISTRY
 # =============================
+
+def _safe_st_error(msg: str) -> None:
+    try: st.error(msg)
+    except Exception: print(f"[ERROR] {msg}")
 
 @st.cache_data(ttl=86400)
 def get_nse_registry() -> pd.DataFrame:
@@ -376,13 +588,13 @@ def get_nse_registry() -> pd.DataFrame:
         df.columns = df.columns.str.strip().str.upper()
         missing = {"SERIES", "SYMBOL"} - set(df.columns)
         if missing:
-            st.error(f"NSE format changed. Missing: {missing}")
+            _safe_st_error(f"NSE format changed. Missing: {missing}")
             return pd.DataFrame()
         df = df[df["SERIES"] == "EQ"].copy()
         df["YF_SYMBOL"] = df["SYMBOL"].astype(str).str.strip() + ".NS"
         return df.reset_index(drop=True)
     except Exception as e:
-        st.error(f"NSE registry download failed: {e}")
+        _safe_st_error(f"NSE registry download failed: {e}")
         return pd.DataFrame()
 
 # =============================
@@ -653,8 +865,8 @@ def estimate_upside(df: pd.DataFrame, price: float, high20: float) -> dict:
 # ETF SCANNER — dynamic registry, sanity-checked data, live progress
 # =============================
 
-def scan_etfs(etf_registry: pd.DataFrame, _counter: st.delta_generator.DeltaGenerator | None = None, _pbar: st.delta_generator.DeltaGenerator | None = None) -> pd.DataFrame:
-    """Fetch live price, RSI, trend, returns for every ETF. Shows live count."""
+def scan_etfs(etf_registry: pd.DataFrame, progress_cb=None) -> pd.DataFrame:
+    """Fetch live price, RSI, trend, returns for every ETF. Reports progress via progress_cb."""
     if etf_registry.empty:
         return pd.DataFrame()
 
@@ -666,16 +878,11 @@ def scan_etfs(etf_registry: pd.DataFrame, _counter: st.delta_generator.DeltaGene
     for i in range(0, total, 50):
         chunk = tickers[i : i + 50]
         done  = min(i + 50, total)
-        if _pbar:
-            _pbar.progress(int(done / total * 100))
-        if _counter:
-            _counter.markdown(
-                f"<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-                f"ETFs &nbsp;<strong style='color:#00c896'>{done}</strong> / {total}</span>",
-                unsafe_allow_html=True,
-            )
+        if progress_cb:
+            try: progress_cb("etf", done, total, f"ETFs {done}/{total}")
+            except Exception: pass
         try:
-            data = yf.download(
+            data = _yf_download(
                 chunk, period="1y", interval="1d",
                 group_by="ticker", threads=True, progress=False, auto_adjust=True,
             )
@@ -769,34 +976,26 @@ def build_etf_context(etf_df: pd.DataFrame) -> str:
 def get_nifty_close(period: str = "1y") -> pd.Series:
     """Fetch ^NSEI close series once per scan for RS calculations."""
     try:
-        hist = yf.Ticker("^NSEI").history(period=period, interval="1d", auto_adjust=True)
+        hist = _yf_ticker("^NSEI").history(period=period, interval="1d", auto_adjust=True)
         if hist.empty:
             return pd.Series(dtype=float)
         return hist["Close"].dropna()
     except Exception:
         return pd.Series(dtype=float)
 
-def scan_market(symbols: list, _counter=None, _pbar=None, nifty_close: pd.Series | None = None) -> pd.DataFrame:
+def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None = None) -> pd.DataFrame:
     results = []
     failed  = []
     total   = len(symbols)
 
-    if _pbar is None:
-        _pbar = st.progress(0)
-    if _counter is None:
-        _counter = st.empty()
-
     for i in range(0, total, CHUNK_SIZE):
         tickers = symbols[i : i + CHUNK_SIZE]
         current = min(i + CHUNK_SIZE, total)
-        _pbar.progress(int(current / total * 100))
-        _counter.markdown(
-            f"<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-            f"Equities &nbsp;<strong style='color:#d4a843'>{current}</strong> / {total}</span>",
-            unsafe_allow_html=True,
-        )
+        if progress_cb:
+            try: progress_cb("scan", current, total, f"Equities {current}/{total}")
+            except Exception: pass
         try:
-            data = yf.download(
+            data = _yf_download(
                 tickers, period="1y", interval="1d",
                 group_by="ticker", threads=True, progress=False, auto_adjust=True,
             )
@@ -906,12 +1105,9 @@ def scan_market(symbols: list, _counter=None, _pbar=None, nifty_close: pd.Series
             except Exception as e:
                 failed.append((ticker, str(e)))
 
-    if _pbar:
-        _pbar.empty()
-    if _counter:
-        _counter.empty()
-    if failed:
-        st.caption(f"⚠ {len(failed)} tickers skipped. First 5: {[f[0] for f in failed[:5]]}")
+    if failed and progress_cb:
+        try: progress_cb("scan", total, total, f"Done — {len(failed)} skipped (e.g. {[f[0] for f in failed[:3]]})")
+        except Exception: pass
     if not results:
         return pd.DataFrame()
     df = pd.DataFrame(results)
@@ -1089,7 +1285,7 @@ def fetch_fundamentals(symbol: str) -> dict:
     """Pull FMP-equivalent fundamentals from yfinance for a single ticker."""
     out = {"symbol": symbol, "fetched_at": fmt_ist("%Y-%m-%d %H:%M IST")}
     try:
-        t = yf.Ticker(symbol)
+        t = _yf_ticker(symbol)
         info = _safe(lambda: t.info, default={}) or {}
         fin  = _safe(lambda: t.financials,  default=pd.DataFrame())
         bal  = _safe(lambda: t.balance_sheet, default=pd.DataFrame())
@@ -1230,7 +1426,7 @@ def fetch_fundamentals(symbol: str) -> dict:
 
     return out
 
-def fetch_fundamentals_bulk(symbols: list, _status=None, _pbar=None) -> dict:
+def fetch_fundamentals_bulk(symbols: list, progress_cb=None) -> dict:
     """Parallel fetch for a list of YF symbols (e.g. 'TCS.NS'). Returns dict by symbol."""
     out = {}
     total = len(symbols)
@@ -1246,14 +1442,9 @@ def fetch_fundamentals_bulk(symbols: list, _status=None, _pbar=None) -> dict:
             except Exception as e:
                 out[sym] = {"symbol": sym, "error": str(e)}
             done += 1
-            if _pbar:
-                _pbar.progress(int(done / total * 100))
-            if _status:
-                _status.markdown(
-                    f"<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-                    f"Fundamentals &nbsp;<strong style='color:#d4a843'>{done}</strong> / {total}</span>",
-                    unsafe_allow_html=True,
-                )
+            if progress_cb:
+                try: progress_cb("funds", done, total, f"Fundamentals {done}/{total}")
+                except Exception: pass
     return out
 
 # =============================
@@ -1582,7 +1773,7 @@ def get_live_market_snapshot() -> str:
     lines = []
     for sym, label in symbols.items():
         try:
-            t    = yf.Ticker(sym)
+            t    = _yf_ticker(sym)
             hist = t.history(period="2d", interval="1d")
             if hist.empty:
                 continue
@@ -1818,143 +2009,56 @@ def best_upside_picks(df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
     )
 
 # =============================
-# RUN BUTTON
+# PIPELINE — pure function, no st.* calls. Called by both the foreground UI
+# (with a widget-backed progress_cb) and the background thread (with a
+# status-file-writing progress_cb).
 # =============================
 
-col_btn, col_note = st.columns([1, 3])
-with col_btn:
-    run = st.button("⚡  Run Market Intelligence")
-with col_note:
-    st.markdown(
-        "<small style='color:#4a5578;font-family:JetBrains Mono,monospace;font-size:0.7rem'>"
-        "~2,000 NSE EQ stocks &nbsp;·&nbsp; 4-stage rally classifier &nbsp;·&nbsp; "
-        "FMP-style fundamentals on shortlist &nbsp;·&nbsp; AI strategy &nbsp;·&nbsp; ~6–8 min"
-        "</small>",
-        unsafe_allow_html=True,
-    )
+def _run_pipeline(cb=None) -> dict:
+    def _step(phase, current, total, msg=""):
+        if cb:
+            try: cb(phase, current, total, msg)
+            except Exception: pass
 
-if run:
-    if "last_run" in st.session_state:
-        elapsed = (now_ist() - st.session_state["last_run"]).total_seconds()
-        if elapsed < 120:
-            st.warning(f"⏳ Please wait {int(120 - elapsed)}s before re-running.")
-            st.stop()
-
-    st.session_state["last_run"] = now_ist()
-    t_phase1 = time.perf_counter()
-
-    # ── Phase 1: Data collection ──────────────────────────────────────
-    st.markdown(
-        "<span style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
-        "color:#4a5578;letter-spacing:0.12em;text-transform:uppercase'>"
-        "Phase 1 &nbsp;·&nbsp; Market Data &amp; Rally Scan</span>",
-        unsafe_allow_html=True,
-    )
-
-    # Equity registry
-    _eq_status = st.empty()
-    _eq_status.markdown(
-        "<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-        "Loading equity list &amp; Nifty benchmark …</span>", unsafe_allow_html=True
-    )
+    _step("registry", 0, 100, "Loading NSE registry & Nifty benchmark")
     registry = get_nse_registry()
     if registry.empty:
-        st.error("Could not load NSE registry.")
-        st.stop()
+        raise RuntimeError("NSE registry empty — cannot continue")
     nifty_close = get_nifty_close()
-    _eq_status.empty()
 
-    # ETF registry + live scan with separate progress
+    _step("etf", 0, 100, "Scanning ETFs")
     etf_registry = get_etf_registry()
-    n_etf_total  = len(etf_registry) if not etf_registry.empty else 0
-    _etf_counter = st.empty()
-    _etf_pbar    = st.progress(0)
-    etf_df = scan_etfs(etf_registry, _etf_counter, _etf_pbar) if not etf_registry.empty else pd.DataFrame()
-    _etf_counter.empty()
-    _etf_pbar.empty()
+    etf_df = scan_etfs(etf_registry, progress_cb=cb) if not etf_registry.empty else pd.DataFrame()
 
-    # Equity momentum scan with its own progress
-    eq_symbols   = registry["YF_SYMBOL"].tolist()
-    n_eq_total   = len(eq_symbols)
-    _eq_counter  = st.empty()
-    _eq_pbar     = st.progress(0)
-    momentum_df  = scan_market(eq_symbols, _eq_counter, _eq_pbar, nifty_close=nifty_close)
-    _eq_counter.empty()
-    _eq_pbar.empty()
+    _step("scan", 0, 100, "Scanning equities")
+    eq_symbols = registry["YF_SYMBOL"].tolist()
+    momentum_df = scan_market(eq_symbols, progress_cb=cb, nifty_close=nifty_close)
 
-    # Build shortlist for deep-dive
-    shortlist_df = build_shortlist(momentum_df)
-    early_rally_df = momentum_df[momentum_df["StageId"].isin([1, 2])].sort_values("Score", ascending=False) if not momentum_df.empty else pd.DataFrame()
-
-    # Print summary counts
-    n_etfs_clean = len(etf_df) if not etf_df.empty else 0
-    elapsed_p1 = time.perf_counter() - t_phase1
-    st.markdown(
-        f"<div style='font-family:JetBrains Mono,monospace;font-size:0.74rem;"
-        f"color:#8896b3;display:flex;gap:20px;padding:6px 0 10px;flex-wrap:wrap'>"
-        f"<span>⬡ <strong style='color:#d4a843'>{n_eq_total:,}</strong> equities</span>"
-        f"<span>◈ <strong style='color:#00c896'>{n_etfs_clean}</strong> ETFs</span>"
-        f"<span>▲ <strong style='color:#f0c96a'>{len(momentum_df)}</strong> signals</span>"
-        f"<span>⚡ <strong style='color:#4f8ef7'>{len(early_rally_df)}</strong> early rally</span>"
-        f"<span>★ <strong style='color:#d4a843'>{len(shortlist_df)}</strong> shortlist</span>"
-        f"<span>⏱ Phase 1 in <strong>{elapsed_p1:.1f}s</strong></span>"
-        f"</div>",
-        unsafe_allow_html=True,
+    shortlist_df   = build_shortlist(momentum_df)
+    early_rally_df = (
+        momentum_df[momentum_df["StageId"].isin([1, 2])].sort_values("Score", ascending=False)
+        if not momentum_df.empty else pd.DataFrame()
     )
 
-    # ── Phase 2: AI Analysis ──────────────────────────────────────────
-    st.markdown(
-        "<span style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
-        "color:#4a5578;letter-spacing:0.12em;text-transform:uppercase'>"
-        "Phase 2 &nbsp;·&nbsp; AI Analysis</span>",
-        unsafe_allow_html=True,
-    )
-    _ai_status = st.empty()
-    _ai_pbar   = st.progress(0)
-
-    def _ai(msg: str, pct: int):
-        _ai_status.markdown(
-            f"<span style='font-family:JetBrains Mono,monospace;font-size:0.76rem;color:#8896b3'>"
-            f"{msg}</span>", unsafe_allow_html=True
-        )
-        _ai_pbar.progress(pct)
-
-    _ai("Fetching live market prices …", 10)
+    _step("intel", 60, 100, "Fetching live market snapshot + news")
     live_snapshot = get_live_market_snapshot()
+    raw_news      = get_raw_news()
 
-    _ai("Pulling latest news …", 25)
-    raw_news = get_raw_news()
-
-    _ai("Analysing market intelligence …", 40)
+    _step("ai-intel", 70, 100, "AI market intelligence brief")
     intel_summary = generate_intel_summary(raw_news, live_snapshot)
 
-    _ai("Building strategy brief …", 65)
-    momentum_context = build_momentum_context(momentum_df)
+    _step("ai-strategy", 80, 100, "AI strategy brief")
     sector_df        = build_sector_heatmap(momentum_df)
     sector_context   = build_sector_context(sector_df)
+    momentum_context = build_momentum_context(momentum_df)
     etf_context      = build_etf_context(etf_df)
-    strategy         = generate_strategy(
-        intel_summary, momentum_context, sector_context, etf_context
-    )
+    strategy         = generate_strategy(intel_summary, momentum_context, sector_context, etf_context)
 
-    _ai_status.empty()
-    _ai_pbar.empty()
-
-    # ── Phase 3: Deep-Dive Fundamentals (parallel) ────────────────────
-    st.markdown(
-        "<span style='font-family:JetBrains Mono,monospace;font-size:0.7rem;"
-        "color:#4a5578;letter-spacing:0.12em;text-transform:uppercase'>"
-        "Phase 3 &nbsp;·&nbsp; FMP-Style Fundamentals (Shortlist)</span>",
-        unsafe_allow_html=True,
-    )
-    _f_status = st.empty()
-    _f_pbar   = st.progress(0)
-    t_phase3 = time.perf_counter()
-    fund_map: dict = {}
+    _step("funds", 90, 100, "Deep-dive fundamentals (shortlist)")
+    fund_map = {}
     if not shortlist_df.empty:
         sl_symbols = [f"{t}.NS" for t in shortlist_df["Ticker"].tolist()]
-        raw_funds  = fetch_fundamentals_bulk(sl_symbols, _f_status, _f_pbar)
-        # Build {sym: {metrics, technicals, recommendation}}
+        raw_funds  = fetch_fundamentals_bulk(sl_symbols, progress_cb=cb)
         for _, t_row in shortlist_df.iterrows():
             sym  = f"{t_row['Ticker']}.NS"
             m    = raw_funds.get(sym, {})
@@ -1966,21 +2070,102 @@ if run:
                        "bull_case": [f"Recommender error: {e}"], "bear_case": [],
                        "entry_zone": (None, None), "stop_loss": None, "targets": {}}
             fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
-    _f_status.empty()
-    _f_pbar.empty()
-    elapsed_p3 = time.perf_counter() - t_phase3
-    st.caption(f"Deep dive fetched for {len(fund_map)} stocks in {elapsed_p3:.1f}s.")
 
-    st.session_state.update({
-        "momentum_df"   : momentum_df,
-        "shortlist_df"  : shortlist_df,
+    return {
+        "momentum_df":    momentum_df,
+        "shortlist_df":   shortlist_df,
         "early_rally_df": early_rally_df,
-        "sector_df"     : sector_df,
-        "etf_df"        : etf_df,
-        "fund_map"      : fund_map,
-        "intel_summary" : intel_summary,
-        "strategy"      : strategy,
-    })
+        "sector_df":      sector_df,
+        "etf_df":         etf_df,
+        "fund_map":       fund_map,
+        "intel_summary":  intel_summary,
+        "strategy":       strategy,
+        "last_run":       now_ist(),
+    }
+
+# =============================
+# RUN BUTTON
+# =============================
+
+# ── streamlit-autorefresh import (used while a background job is running) ──
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    def st_autorefresh(*args, **kwargs):  # graceful fallback if package missing
+        return 0
+
+# ── Drain any AI debug entries emitted from a background thread ──
+if _AI_DEBUG_BUFFER:
+    log = st.session_state.get("ai_debug", [])
+    log.extend(_AI_DEBUG_BUFFER)
+    st.session_state["ai_debug"] = log
+    _AI_DEBUG_BUFFER.clear()
+
+# ── Reattach to the latest completed background result, if any ──
+_latest_mtime = _result_mtime()
+if _latest_mtime > 0 and st.session_state.get("_result_mtime", 0) < _latest_mtime:
+    _payload = _load_result()
+    if _payload:
+        st.session_state.update(_payload)
+        st.session_state["_result_mtime"] = _latest_mtime
+
+# ── Run button + status banner ────────────────────────────────────────
+col_btn, col_note = st.columns([1, 3])
+_job_running = _job_alive()
+with col_btn:
+    run = st.button(
+        "⏳  Job running …" if _job_running else "⚡  Run Market Intelligence",
+        disabled=_job_running,
+    )
+with col_note:
+    st.markdown(
+        "<small style='color:#4a5578;font-family:JetBrains Mono,monospace;font-size:0.7rem'>"
+        "~2,000 NSE EQ stocks &nbsp;·&nbsp; 4-stage rally classifier &nbsp;·&nbsp; "
+        "FMP-style fundamentals on shortlist &nbsp;·&nbsp; AI strategy &nbsp;·&nbsp; "
+        "<strong style='color:#00c896'>safe to close tab once started</strong>"
+        "</small>",
+        unsafe_allow_html=True,
+    )
+
+if run and not _job_running:
+    job_id = start_background_job()
+    st.session_state["_active_job_id"] = job_id
+    # Brief pause to let the thread write its first status entry
+    time.sleep(0.4)
+    st.rerun()
+
+# ── Live status banner + auto-refresh while a job is running ──────────
+if _job_alive():
+    status = _read_status() or {}
+    cur = int(status.get("current") or 0)
+    tot = int(status.get("total") or 100) or 100
+    pct = max(0, min(100, int(cur / tot * 100))) if tot else 0
+    phase = status.get("phase", "—")
+    msg   = status.get("msg", "")
+    jid   = status.get("job_id", "—")
+    started = status.get("started_at", "")
+    try:
+        started_h = datetime.fromisoformat(started).astimezone(IST).strftime("%H:%M IST")
+    except Exception:
+        started_h = "—"
+
+    st.markdown(
+        f"<div style='margin-top:14px;padding:14px 18px;border:1px solid rgba(212,168,67,0.25);"
+        f"border-left:3px solid #d4a843;border-radius:0 12px 12px 0;background:rgba(15,20,40,0.7);"
+        f"font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c0e8d8'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px'>"
+        f"<span><strong style='color:#d4a843'>● BACKGROUND JOB</strong> &nbsp; "
+        f"phase <strong>{phase}</strong> &nbsp; · &nbsp; {msg}</span>"
+        f"<span style='color:#8896b3'>job <strong>{jid}</strong> · since {started_h}</span>"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.progress(pct)
+    st.caption("This scan runs server-side — you can close this tab and the work will continue. The page will reload automatically every 3 s.")
+    st_autorefresh(interval=3000, key="bg_job_poll")
+elif (_read_status() or {}).get("error"):
+    err = _read_status().get("error", "unknown error")
+    st.error(f"Last background job failed: {err}")
 
 # =============================
 # DISPLAY RESULTS
@@ -2068,10 +2253,10 @@ if "strategy" in st.session_state:
             fmt = {k: v for k, v in fmt.items() if k in display_cols}
 
             styler = momentum_df[display_cols].style.format(fmt, na_rep="N/A")
-            if "Stage"    in display_cols: styler = styler.applymap(color_stage,      subset=["Stage"])
-            if "Score"    in display_cols: styler = styler.applymap(color_score,      subset=["Score"])
-            if "Upside %" in display_cols: styler = styler.applymap(color_upside,     subset=["Upside %"])
-            if "RSI"      in display_cols: styler = styler.applymap(color_rsi_stock,  subset=["RSI"])
+            if "Stage"    in display_cols: styler = styler.map(color_stage,      subset=["Stage"])
+            if "Score"    in display_cols: styler = styler.map(color_score,      subset=["Score"])
+            if "Upside %" in display_cols: styler = styler.map(color_upside,     subset=["Upside %"])
+            if "RSI"      in display_cols: styler = styler.map(color_rsi_stock,  subset=["RSI"])
 
             st.dataframe(styler, use_container_width=True, height=520)
             st.caption(f"All {len(momentum_df)} signals · ranked by composite Score. Stage 4 rows are kept but down-weighted.")
@@ -2304,7 +2489,7 @@ if "strategy" in st.session_state:
                 return ""
             st.dataframe(
                 sector_df_st.style
-                    .applymap(color_avg_up, subset=["Avg Upside %"])
+                    .map(color_avg_up, subset=["Avg Upside %"])
                     .format({"Avg Upside %": "+{:.1f}%"}),
                 use_container_width=True, height=460,
             )
