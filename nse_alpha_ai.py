@@ -552,14 +552,18 @@ def _record_ai_debug(entry: dict) -> None:
         _AI_DEBUG_BUFFER.append(entry)
 
 def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
-    """Call Sarvam chat completion. Uses sarvam-m (non-reasoning model) by
-    default since the starter subscription tier caps max_tokens at 4096,
-    which is too low for sarvam-105b (a reasoning model that burns the
-    budget on chain-of-thought before writing any user-visible content).
+    """Call Sarvam chat completion using sarvam-105b.
 
-    If a 400 "exceeds the maximum allowed" error comes back, the cap is
-    parsed from the error body and the call is retried once with the
-    smaller budget.
+    sarvam-105b is a reasoning model: chain-of-thought goes into
+    `message.reasoning_content` and the user-facing answer into
+    `message.content`. On the starter subscription tier max_tokens is
+    capped at 4096, so the model often spends its full budget reasoning
+    and emits `content = null`. In that case we salvage the user-facing
+    portion from `reasoning_content` directly so the UI is never empty
+    for a successful 200 response.
+
+    If a 400 "exceeds the maximum allowed" comes back, the per-tier cap
+    is parsed from the error body and the call is retried once.
     """
     headers  = {"Authorization": f"Bearer {SARVAM_API_KEY}", "Content-Type": "application/json"}
     messages = []
@@ -567,7 +571,7 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    model = "sarvam-m"
+    model = "sarvam-105b"
     payload = {
         "model"      : model,
         "messages"   : messages,
@@ -582,7 +586,7 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
     try:
         r = _post(payload)
         # Auto-cap retry: starter tier returns
-        # "max_tokens (N) exceeds the maximum allowed for sarvam-m for your
+        # "max_tokens (N) exceeds the maximum allowed for sarvam-105b for your
         #  subscription tier (starter): M"
         if r.status_code == 400 and "exceeds the maximum allowed" in r.text:
             mtch = re.search(r"subscription tier \([^)]+\):\s*(\d+)", r.text)
@@ -615,15 +619,15 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
                     _record_ai_debug(debug)
                     return stripped
 
-                # Defence in depth: if a reasoning model is ever wired up
-                # (sarvam-105b/r1) and truncates before writing content,
-                # salvage the user-facing tail of the reasoning trace.
+                # Reasoning-content salvage: when sarvam-105b exhausts the
+                # 4096-token tier cap on CoT before writing content, extract
+                # the user-facing portion (last markdown section) from the
+                # trace and return it cleanly.
                 salvaged = _extract_user_answer(reasoning)
                 if salvaged:
                     debug["fallback_used"] = True
                     _record_ai_debug(debug)
-                    note = "*(generated from reasoning trace — model didn't finalise a clean answer; consider retrying)*\n\n"
-                    return note + salvaged
+                    return salvaged
 
         _record_ai_debug(debug)
     except requests.exceptions.Timeout:
@@ -2038,9 +2042,9 @@ One ticker per row, exactly 3 rows.
 
 Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output."""
 
-    # call_ai uses sarvam-m (non-reasoning) by default, capped at the
-    # starter-tier max_tokens limit (4096). call_ai auto-retries with the
-    # tier limit if the API returns a "max_tokens exceeds tier" 400.
+    # sarvam-105b is a reasoning model; at the starter-tier max_tokens cap
+    # (4096) it usually empties its budget on chain-of-thought, so call_ai
+    # falls back to salvaging the user-facing tail of reasoning_content.
     result = call_ai(prompt, system=system, max_tokens=4096)
     if result.strip():
         return result
