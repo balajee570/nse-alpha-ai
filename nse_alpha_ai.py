@@ -551,24 +551,50 @@ def _record_ai_debug(entry: dict) -> None:
     except Exception:
         _AI_DEBUG_BUFFER.append(entry)
 
-def call_ai(prompt: str, system: str = "", max_tokens: int = 24000) -> str:
+def call_ai(prompt: str, system: str = "", max_tokens: int = 4096) -> str:
+    """Call Sarvam chat completion. Uses sarvam-m (non-reasoning model) by
+    default since the starter subscription tier caps max_tokens at 4096,
+    which is too low for sarvam-105b (a reasoning model that burns the
+    budget on chain-of-thought before writing any user-visible content).
+
+    If a 400 "exceeds the maximum allowed" error comes back, the cap is
+    parsed from the error body and the call is retried once with the
+    smaller budget.
+    """
     headers  = {"Authorization": f"Bearer {SARVAM_API_KEY}", "Content-Type": "application/json"}
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    model = "sarvam-m"
     payload = {
-        "model"      : "sarvam-105b",
+        "model"      : model,
         "messages"   : messages,
         "max_tokens" : max_tokens,
         "temperature": 0.5,
         "top_p"      : 1,
     }
 
+    def _post(p):
+        return requests.post(SARVAM_URL, headers=headers, json=p, timeout=240)
+
     try:
-        r = requests.post(SARVAM_URL, headers=headers, json=payload, timeout=240)
-        debug = {"model": "sarvam-105b", "status": r.status_code, "body": r.text[:1200]}
+        r = _post(payload)
+        # Auto-cap retry: starter tier returns
+        # "max_tokens (N) exceeds the maximum allowed for sarvam-m for your
+        #  subscription tier (starter): M"
+        if r.status_code == 400 and "exceeds the maximum allowed" in r.text:
+            mtch = re.search(r"subscription tier \([^)]+\):\s*(\d+)", r.text)
+            if mtch:
+                tier_cap = int(mtch.group(1))
+                payload["max_tokens"] = min(max_tokens, tier_cap)
+                _record_ai_debug({"model": model, "status": 400,
+                                  "note": f"max_tokens capped to tier limit {tier_cap}",
+                                  "body": r.text[:600]})
+                r = _post(payload)
+
+        debug = {"model": model, "status": r.status_code, "body": r.text[:1200]}
 
         if r.status_code == 200:
             choices = r.json().get("choices", [])
@@ -589,9 +615,9 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 24000) -> str:
                     _record_ai_debug(debug)
                     return stripped
 
-                # Reasoning-content fallback: salvage the user-facing portion
-                # from the chain-of-thought when sarvam-105b truncates before
-                # writing the answer.
+                # Defence in depth: if a reasoning model is ever wired up
+                # (sarvam-105b/r1) and truncates before writing content,
+                # salvage the user-facing tail of the reasoning trace.
                 salvaged = _extract_user_answer(reasoning)
                 if salvaged:
                     debug["fallback_used"] = True
@@ -601,9 +627,9 @@ def call_ai(prompt: str, system: str = "", max_tokens: int = 24000) -> str:
 
         _record_ai_debug(debug)
     except requests.exceptions.Timeout:
-        _record_ai_debug({"model": "sarvam-105b", "error": "Timed out after 240s"})
+        _record_ai_debug({"model": model, "error": "Timed out after 240s"})
     except Exception as e:
-        _record_ai_debug({"model": "sarvam-105b", "error": str(e)})
+        _record_ai_debug({"model": model, "error": str(e)})
 
     return ""
 
@@ -1884,7 +1910,7 @@ Keep each section to 3–4 sentences/bullets. No filler.
 
 Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output.
 """
-    result = call_ai(prompt, system=system, max_tokens=24000)
+    result = call_ai(prompt, system=system, max_tokens=4096)
     return result if result.strip() else "Market intelligence could not be generated."
 
 # =============================
@@ -2012,12 +2038,10 @@ One ticker per row, exactly 3 rows.
 
 Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output."""
 
-    # sarvam-105b is a reasoning model — it uses tokens for internal thinking
-    # (reasoning_content) BEFORE writing the actual response (content).
-    # max_tokens must cover BOTH. call_ai now also salvages content from
-    # reasoning_content when finish_reason=length, so output is never empty
-    # for a successful 200 response.
-    result = call_ai(prompt, system=system, max_tokens=24000)
+    # call_ai uses sarvam-m (non-reasoning) by default, capped at the
+    # starter-tier max_tokens limit (4096). call_ai auto-retries with the
+    # tier limit if the API returns a "max_tokens exceeds tier" 400.
+    result = call_ai(prompt, system=system, max_tokens=4096)
     if result.strip():
         return result
 
@@ -2028,7 +2052,7 @@ STOCK SCAN (picks must come ONLY from here, no ETFs):{stocks_short[:400]}
 Write: **MARKET PULSE** 2 sentences. **TOP 3 BUY PICKS** table from STOCK SCAN only. **AVOID** 2 bullets.
 
 Output the markdown directly. Do not reproduce planning, instructions, or deliberation in the output."""
-    result = call_ai(mini, system=system, max_tokens=16000)
+    result = call_ai(mini, system=system, max_tokens=4096)
     return result if result.strip() else "Strategy unavailable — API timeout. Scan data above is valid."
 
 # =============================
@@ -2515,7 +2539,7 @@ if "strategy" in st.session_state:
                         f"Output the thesis directly. Do not reproduce planning, instructions, or deliberation."
                     )
                     with st.spinner("Drafting thesis …"):
-                        thesis = call_ai(prompt_th, system=sys, max_tokens=16000)
+                        thesis = call_ai(prompt_th, system=sys, max_tokens=4096)
                     if thesis:
                         st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
                     else:
