@@ -2,6 +2,8 @@ streamlit
 requests
 pandas
 numpy
-yfinance
+yfinance>=0.2.65
 tavily-python
 openpyxl
+curl_cffi
+streamlit-autorefresh
