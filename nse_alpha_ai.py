@@ -254,6 +254,8 @@ CHUNK_SIZE         = 80
 MAX_DISPLAY_STOCKS = 12
 RSI_PERIOD         = 14
 RSI_OVERBOUGHT     = 72   # stocks above this are excluded from Top 3 picks
+MIN_PRICE          = 10.0 # ₹ — skip penny names in the market scan
+MIN_TURNOVER_CR    = 2.0  # ₹ crore — min 20d avg daily traded value
 
 # ── Rally classifier / shortlist ────────────────────────────────────
 SHORTLIST_TARGET     = 25
@@ -868,6 +870,22 @@ def dist_from_ma(price: float, ma: float) -> float:
     if not ma or ma <= 0 or not np.isfinite(price) or not np.isfinite(ma):
         return np.nan
     return round((price / ma - 1) * 100, 2)
+
+def weekly_uptrend(close: pd.Series) -> bool | None:
+    """Higher-timeframe confirmation: True when the weekly close sits above a
+    rising 10-week MA, False when it doesn't, None when there's not enough
+    history to judge. Filters daily-only noise out of fresh-buy conviction."""
+    try:
+        w = close.resample("W").last().dropna()
+        if len(w) < 12:
+            return None
+        ma10 = w.rolling(10).mean()
+        if not (np.isfinite(ma10.iloc[-1]) and np.isfinite(ma10.iloc[-3])):
+            return None
+        return bool(float(w.iloc[-1]) > float(ma10.iloc[-1])
+                    and float(ma10.iloc[-1]) >= float(ma10.iloc[-3]))
+    except Exception:
+        return None
 
 # =============================
 # RALLY STAGE CLASSIFIER
@@ -1489,9 +1507,20 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                 vol_avg   = float(df["Volume"].iloc[-(VOL_LOOKBACK + 1):-1].mean())
                 vol_now   = float(df["Volume"].iloc[-1])
                 vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
+
+                # Liquidity + data-sanity guard: skip penny / thinly-traded
+                # names (targets and stops are meaningless against wide
+                # spreads) and bars with glitch-sized single-day moves.
+                turnover_cr = price * vol_avg / 1e7
+                if price < MIN_PRICE or turnover_cr < MIN_TURNOVER_CR:
+                    continue
+                if (close.pct_change(fill_method=None).iloc[-5:].abs() > 0.35).any():
+                    continue
+
                 rsi       = compute_rsi(close)
                 atr_pct   = compute_atr_pct(df)
                 upside    = estimate_upside(df, price, high20)
+                wk_up     = weekly_uptrend(close)
 
                 macd_last, sig_last, hist_last, hist_series = compute_macd(close)
                 macd_above_signal = bool(np.isfinite(macd_last) and np.isfinite(sig_last) and macd_last > sig_last)
@@ -1567,6 +1596,8 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                     "Upside %"     : upside["upside_pct"],
                     "52W High ₹"   : upside["high52"],
                     "Gap to 52W %" : upside["high52_gap_pct"],
+                    "Weekly Up"    : wk_up,
+                    "Turnover ₹Cr" : round(turnover_cr, 2),
                     "Pattern"      : pat.get("name"),
                     "Pattern Q"    : pat.get("quality"),
                     "New 52W High" : bool(upside.get("high52_gap_pct") is not None
@@ -1706,6 +1737,9 @@ def compute_single_stock_technicals(symbol_yf: str, _nifty_hash: int = 0) -> dic
     row["Pattern Q"]    = pat.get("quality")
     row["New 52W High"] = bool(upside.get("high52_gap_pct") is not None
                                and abs(upside["high52_gap_pct"]) < 0.5)
+    row["Weekly Up"]    = weekly_uptrend(close)
+    turnover_cr = price * vol_avg / 1e7 if vol_avg else np.nan
+    row["Turnover ₹Cr"] = round(turnover_cr, 2) if np.isfinite(turnover_cr) else np.nan
     # Single-row score via the same composite engine (with std fallback).
     scored = compute_composite_score(pd.DataFrame([row]))
     row["Score"] = float(scored.iloc[0]["Score"]) if not scored.empty else np.nan
@@ -1753,7 +1787,18 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
         0.10 * rs_w    +
         0.05 * up_w
     )
-    d["Score"] = score.round(1)
+    # Higher-timeframe nudge: weekly close above a rising 10-wk MA earns +4,
+    # a confirmed weekly downtrend costs 6, unknown leaves the score as-is.
+    if "Weekly Up" in d.columns:
+        def _wk_adj(v):
+            try:
+                if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                    return 0.0
+                return 4.0 if bool(v) else -6.0
+            except Exception:
+                return 0.0
+        score = score + d["Weekly Up"].apply(_wk_adj)
+    d["Score"] = score.clip(0, 100).round(1)
     return d
 
 def attach_rs_rank(df: pd.DataFrame) -> pd.DataFrame:
@@ -2279,6 +2324,8 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
               lambda: "Operating margin < 5%"),
         _flag(lambda: _lt(dcf_up, -20),
               lambda: f"DCF says overvalued ({dcf_up:.0f}%)"),
+        _flag(lambda: tech.get("Weekly Up") == False,   # None/NaN must NOT match
+              lambda: "Weekly timeframe trend is down"),
     ]
     bear = [b for b in bear_candidates if b]
 
@@ -2394,6 +2441,11 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
     if risk_reward is not None and risk_reward < 1.8 and action in ("STRONG_BUY", "BUY"):
         action = "ACCUMULATE"
 
+    # Higher-timeframe veto: a confirmed weekly downtrend caps fresh
+    # conviction at BUY (None/NaN — unknown — must NOT trigger this).
+    if tech.get("Weekly Up") == False and action == "STRONG_BUY":
+        action = "BUY"
+
     # Earnings-gap guard: a stop can't protect through an overnight results
     # gap, so fresh entries within 3 days of earnings wait for the print.
     earnings_in_days = None
@@ -2469,6 +2521,9 @@ def _hist_conn() -> sqlite3.Connection:
         action TEXT, conviction REAL, entry_low REAL, entry_high REAL,
         stop REAL, t1 REAL, t2 REAL, t3 REAL,
         PRIMARY KEY (scan_id, ticker))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS positions (
+        ticker TEXT PRIMARY KEY, buy_price REAL, qty REAL,
+        buy_date TEXT, added_at TEXT)""")
     return conn
 
 def _f_or_none(v):
@@ -2718,6 +2773,80 @@ def live_shortlist_check(shortlist_df: pd.DataFrame, fund_map: dict) -> pd.DataF
             "Action": rec.get("action"), "Stop ₹": stop, "T1 ₹": t1, "T2 ₹": t2,
             "To Stop %": round((stop / last - 1) * 100, 1) if stop else None,
             "To T2 %":   round((t2 / last - 1) * 100, 1) if t2 else None,
+            "Status": status,
+        })
+    return pd.DataFrame(rows)
+
+# =============================
+# PORTFOLIO — user holdings persisted in the history DB, re-evaluated on
+# demand with the exact same engine as Deep Dive. Works with or without a
+# fresh market scan, so hold/trim/exit calls are available at any time.
+# =============================
+
+def load_positions() -> pd.DataFrame:
+    try:
+        if not HIST_DB.exists():
+            return pd.DataFrame()
+        with _hist_conn() as conn:
+            return pd.read_sql_query("SELECT * FROM positions ORDER BY ticker", conn)
+    except Exception:
+        return pd.DataFrame()
+
+def upsert_position(ticker: str, buy_price: float, qty: float, buy_date: str) -> None:
+    try:
+        with _hist_conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?)",
+                         (str(ticker).upper(), float(buy_price), float(qty),
+                          str(buy_date), now_ist().isoformat()))
+    except Exception:
+        pass
+
+def delete_positions(tickers: list) -> None:
+    try:
+        with _hist_conn() as conn:
+            conn.executemany("DELETE FROM positions WHERE ticker = ?",
+                             [(str(t).upper(),) for t in tickers])
+    except Exception:
+        pass
+
+def evaluate_positions(pos_df: pd.DataFrame, regime_label: str | None = None) -> pd.DataFrame:
+    """Re-evaluate every saved position with current technicals + fundamentals.
+    Sequential — portfolios are small and both fetches are cached."""
+    rows = []
+    for _, p in pos_df.iterrows():
+        t   = str(p["ticker"]).upper()
+        sym = f"{t}.NS"
+        try:
+            tech = compute_single_stock_technicals(sym)
+        except Exception:
+            tech = None
+        if not tech:
+            rows.append({"Ticker": t, "Status": "NO DATA"})
+            continue
+        try:
+            metrics = fetch_fundamentals(sym)
+        except Exception:
+            metrics = {}
+        rec    = recommend_action(metrics, tech, regime_label)
+        now_px = _f_or_none(tech.get("Price ₹"))
+        buy    = _f_or_none(p.get("buy_price"))
+        qty    = _f_or_none(p.get("qty")) or 0
+        stop   = rec.get("stop_loss")
+        tiers  = rec.get("tiers") or {}
+        status = "OK"
+        if stop and now_px and now_px <= stop:
+            status = "BELOW STOP"
+        elif rec.get("action") in ("SELL", "REDUCE"):
+            status = "ACTION NEEDED"
+        rows.append({
+            "Ticker": t, "Qty": qty, "Buy ₹": buy, "Now ₹": now_px,
+            "P&L %": round((now_px / buy - 1) * 100, 2) if (buy and now_px) else None,
+            "P&L ₹": round((now_px - buy) * qty, 0) if (buy and now_px and qty) else None,
+            "Trend": rec.get("trend"), "Stage": tech.get("Stage"),
+            "Action": rec.get("action"), "If Holding": rec.get("holder_action"),
+            "Conviction": rec.get("conviction"),
+            "Stop ₹": stop, "T2 ₹": tiers.get("T2"),
+            "Earnings (d)": rec.get("earnings_in_days"),
             "Status": status,
         })
     return pd.DataFrame(rows)
@@ -3340,6 +3469,11 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
     hcol3.metric("Stage", tech_row.get("Stage", "—"))
     hcol4.metric("Score", _num(tech_row.get("Score"), decimals=1))
 
+    tcr = tech_row.get("Turnover ₹Cr")
+    if isinstance(tcr, (int, float)) and np.isfinite(tcr) and tcr < MIN_TURNOVER_CR:
+        st.warning(f"Low liquidity: avg daily turnover ₹{tcr:.2f} Cr (below ₹{MIN_TURNOVER_CR:.0f} Cr) "
+                   f"— wide spreads and slippage likely; targets and stops are less dependable here.")
+
     # Recommendation card
     action = rec.get("action", "—")
     color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
@@ -3542,6 +3676,91 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
                 st.warning("Thesis unavailable (AI call failed). Check Debug Log.")
 
 # =============================
+# PORTFOLIO SECTION — rendered both as a results tab and on the empty state,
+# so position-level hold/trim/exit calls never require a fresh market scan.
+# =============================
+
+def render_portfolio_section(regime_label: str | None = None) -> None:
+    st.markdown('<div class="section-header">My Portfolio · Hold / Add / Trim / Exit</div>', unsafe_allow_html=True)
+    st.caption("Add your actual holdings; every evaluation runs the same trend-gated engine as "
+               "Deep Dive against the latest prices — no market scan required.")
+
+    registry = get_nse_registry()
+    symbols  = (sorted(registry["SYMBOL"].astype(str).unique())
+                if registry is not None and not registry.empty else [])
+    with st.form("add_position_form", clear_on_submit=True):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        if symbols:
+            sel = c1.selectbox("Ticker", symbols, index=None, placeholder="e.g. TCS")
+        else:
+            sel = c1.text_input("Ticker (NSE symbol)")
+        bp = c2.number_input("Avg buy price ₹", min_value=0.0, value=0.0, step=1.0)
+        q  = c3.number_input("Quantity", min_value=0.0, value=0.0, step=1.0)
+        bd = c4.date_input("Buy date", value=now_ist().date())
+        if st.form_submit_button("Add / Update position"):
+            if sel and bp > 0 and q > 0:
+                upsert_position(str(sel), bp, q, bd.isoformat())
+                st.success(f"Saved {str(sel).upper()}")
+            else:
+                st.warning("Need a ticker, a buy price > 0, and a quantity > 0.")
+
+    pos = load_positions()
+    if pos.empty:
+        st.info("No positions saved yet — add your holdings above to get hold/trim/exit calls "
+                "on them at any time, even without running a scan.")
+        return
+
+    dc1, dc2 = st.columns([3, 1])
+    del_sel = dc1.multiselect("Remove positions", pos["ticker"].tolist())
+    if dc2.button("Delete selected") and del_sel:
+        delete_positions(del_sel)
+        st.rerun()
+
+    if st.button(f"⚡ Evaluate {len(pos)} position(s) now"):
+        with st.spinner("Evaluating positions with current prices + fundamentals …"):
+            st.session_state["portfolio_eval"] = evaluate_positions(pos, regime_label)
+            st.session_state["portfolio_eval_at"] = fmt_ist()
+
+    ev = st.session_state.get("portfolio_eval")
+    if ev is not None and not ev.empty:
+        st.caption(f"Evaluated {st.session_state.get('portfolio_eval_at', '—')}")
+        priced = ev.dropna(subset=["Buy ₹", "Now ₹"]) if {"Buy ₹", "Now ₹"}.issubset(ev.columns) else pd.DataFrame()
+        if not priced.empty:
+            invested = float((priced["Buy ₹"] * priced["Qty"]).sum())
+            current  = float((priced["Now ₹"] * priced["Qty"]).sum())
+            pm1, pm2, pm3 = st.columns(3)
+            pm1.metric("Invested ₹", f"{invested:,.0f}")
+            pm2.metric("Current ₹",  f"{current:,.0f}",
+                       f"{(current / invested - 1) * 100:+.1f}%" if invested > 0 else None)
+            pm3.metric("Need attention", f"{int((ev['Status'] != 'OK').sum())}")
+
+        def color_pos_action(val):
+            colors = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
+                      "HOLD":"#8896b3","REDUCE":"#f59e0b","SELL":"#f87171","AVOID":"#f87171"}
+            c = colors.get(val, "")
+            return f"color:{c};font-weight:700" if c else ""
+        def color_pos_status(val):
+            if val in ("BELOW STOP",): return "color:#f87171;font-weight:700"
+            if val in ("ACTION NEEDED", "NO DATA"): return "color:#f59e0b;font-weight:700"
+            return "color:#00c896"
+        def color_pos_pnl(val):
+            try: v = float(val)
+            except Exception: return ""
+            return "color:#00c896;font-weight:700" if v > 0 else ("color:#f87171;font-weight:700" if v < 0 else "")
+
+        styler = ev.style.format({
+            "Qty": "{:,.0f}", "Buy ₹": "₹{:.2f}", "Now ₹": "₹{:.2f}",
+            "P&L %": "{:+.2f}%", "P&L ₹": "₹{:+,.0f}", "Conviction": "{:.0f}",
+            "Stop ₹": "₹{:.2f}", "T2 ₹": "₹{:.2f}", "Earnings (d)": "{:.0f}",
+        }, na_rep="—")
+        if "Action" in ev.columns: styler = styler.map(color_pos_action, subset=["Action"])
+        if "Status" in ev.columns: styler = styler.map(color_pos_status, subset=["Status"])
+        if "P&L %"  in ev.columns: styler = styler.map(color_pos_pnl,    subset=["P&L %"])
+        st.dataframe(styler, use_container_width=True, hide_index=True)
+        st.caption("BELOW STOP = price under the current structure stop. "
+                   "'If Holding' is the call for the position; 'Action' is the call for new money.")
+
+# =============================
 # DISPLAY RESULTS
 # =============================
 
@@ -3594,8 +3813,8 @@ if "strategy" in st.session_state:
             unsafe_allow_html=True,
         )
 
-    tab_scan, tab_early, tab_deep, tab_search, tab_sector, tab_track, tab_intel, tab_dl = st.tabs([
-        "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock",
+    tab_scan, tab_early, tab_deep, tab_search, tab_port, tab_sector, tab_track, tab_intel, tab_dl = st.tabs([
+        "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock", "Portfolio",
         "Sector Leadership", "Tracker & Validation", "Intel & Strategy", "Downloads",
     ])
 
@@ -3640,8 +3859,8 @@ if "strategy" in st.session_state:
                 return "color:#f87171;font-weight:700" if val and val > RSI_OVERBOUGHT else ""
 
             display_cols = [c for c in [
-                "Ticker","Price ₹","Grade","Stage","Score","RS Rank","Pattern","Pattern Q",
-                "Signal","RSI","Vol Ratio","ADX","MACD Hist","RS vs Nifty","ROC20 %",
+                "Ticker","Price ₹","Grade","Stage","Score","RS Rank","Weekly Up","Pattern","Pattern Q",
+                "Signal","RSI","Vol Ratio","Turnover ₹Cr","ADX","MACD Hist","RS vs Nifty","ROC20 %",
                 "MA50","MA200","Dist MA50 %","Dist MA200 %","Target ₹","Upside %",
                 "52W High ₹","Gap to 52W %","New 52W High",
             ] if c in momentum_df.columns]
@@ -3652,7 +3871,7 @@ if "strategy" in st.session_state:
                 "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%","ADX":"{:.1f}",
                 "MACD Hist":"{:.3f}","RS vs Nifty":"{:.2f}","ROC20 %":"{:+.1f}%",
                 "Dist MA50 %":"{:+.1f}%","Dist MA200 %":"{:+.1f}%","Score":"{:.1f}",
-                "RS Rank":"{:.0f}","Pattern Q":"{:.0f}",
+                "RS Rank":"{:.0f}","Pattern Q":"{:.0f}","Turnover ₹Cr":"{:.1f}",
             }
             fmt = {k: v for k, v in fmt.items() if k in display_cols}
 
@@ -3798,7 +4017,13 @@ if "strategy" in st.session_state:
                 st.info("Select a stock from the dropdown above to see its full deep dive.")
 
     # =======================================================
-    # TAB 4 — SECTOR HEATMAP
+    # TAB 5 — PORTFOLIO
+    # =======================================================
+    with tab_port:
+        render_portfolio_section((regime or {}).get("label"))
+
+    # =======================================================
+    # TAB — SECTOR HEATMAP
     # =======================================================
     with tab_sector:
         st.markdown('<div class="section-header">Sector Leadership · NSE Sector Indices</div>', unsafe_allow_html=True)
@@ -4026,3 +4251,7 @@ else:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Portfolio works without a scan — holders get hold/trim/exit calls anytime.
+    st.markdown("<hr>", unsafe_allow_html=True)
+    render_portfolio_section(None)
