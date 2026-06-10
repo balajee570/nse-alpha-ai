@@ -705,9 +705,11 @@ def get_nse_registry() -> pd.DataFrame:
 # =============================
 
 def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> float:
+    # Wilder smoothing (ewm alpha=1/period), matching the standard RSI used by
+    # charting platforms — the plain rolling mean overstates extremes.
     delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    gain  = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
     rs    = gain / loss.replace(0, np.nan)
     rsi   = 100 - (100 / (1 + rs))
     return round(float(rsi.iloc[-1]), 1) if not rsi.empty else np.nan
@@ -2117,26 +2119,31 @@ def _coalesce(v, default):
         return default
 
 def _recommend_action_safe_stub(reason: str = "unknown error") -> dict:
-    return {"action": "HOLD", "conviction": 0,
+    return {"action": "HOLD", "holder_action": "HOLD", "trend": "UNKNOWN",
+            "conviction": 0,
             "scores": {"technical": 0, "quality": 0, "value": 0, "growth": 0},
             "bull_case": [f"Recommender unavailable: {reason}"],
             "bear_case": ["Insufficient data to score"],
-            "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+            "entry_zone": (None, None), "stop_loss": None, "targets": {},
+            "tiers": {}, "risk_reward": None}
 
-def recommend_action(metrics: dict, tech: dict) -> dict:
+def recommend_action(metrics: dict, tech: dict, regime_label: str | None = None) -> dict:
     """
     metrics = fundamentals dict from fetch_fundamentals.
     tech    = single-stock row from the momentum scan (Score, Stage, ATR %, RSI, ADX, RS, Upside %, etc.).
-    Returns {action, conviction, bull_case, bear_case, entry_zone, stop_loss, targets}.
+    regime_label = optional market-regime label (AGGRESSIVE/SELECTIVE/DEFENSIVE)
+    that shifts the conviction thresholds for fresh buys.
+    Returns {action, holder_action, trend, conviction, bull_case, bear_case,
+    entry_zone, stop_loss, targets, tiers, risk_reward}.
     Wrapped in a top-level try/except so an unexpected per-stock edge case
     can never blank out the Deep Dive card — we degrade to the HOLD stub.
     """
     try:
-        return _recommend_action_impl(metrics, tech)
+        return _recommend_action_impl(metrics, tech, regime_label)
     except Exception as e:
         return _recommend_action_safe_stub(str(e))
 
-def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
+def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None = None) -> dict:
     price = _coalesce(tech.get("Price ₹"), _coalesce(metrics.get("price"), 0))
     atrp  = _coalesce(tech.get("ATR %"), 3.0)
     try:
@@ -2257,25 +2264,71 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
         or stage_id == 4
     )
 
-    if stage_id == 4:
-        action = "AVOID"
-    elif conviction >= 80 and not critical_bear:
-        action = "STRONG_BUY"
-    elif conviction >= 65:
-        action = "BUY"
-    elif conviction >= 50:
-        action = "ACCUMULATE"
-    elif conviction >= 35:
-        action = "HOLD"
+    # ── Trend state (price vs MA50/MA200) — drives holder vs new-money calls ──
+    def _fin(v):
+        return isinstance(v, (int, float)) and np.isfinite(v)
+
+    ma50      = _coalesce(tech.get("MA50"), None)
+    ma200     = _coalesce(tech.get("MA200"), None)
+    macd_hist = _coalesce(tech.get("MACD Hist"), None)
+    rsi_v     = _coalesce(tech.get("RSI"), None)
+
+    if _fin(price) and _fin(ma200):
+        if _fin(ma50) and price > ma50 and ma50 > ma200:
+            trend = "UPTREND"
+        elif price < ma200:
+            trend = "DOWNTREND"
+        elif _fin(ma50) and price < ma50:
+            trend = "PULLBACK"
+        else:
+            trend = "RECOVERY"
     else:
-        action = "AVOID"
+        trend = "UNKNOWN"
+
+    macd_bear = bool(_fin(macd_hist) and macd_hist < 0)
+    weak_mom  = bool(_fin(rsi_v) and rsi_v < 45)
+
+    # Regime-aware thresholds: demand more conviction in a DEFENSIVE tape,
+    # slightly less in an AGGRESSIVE one.
+    shift = {"AGGRESSIVE": -5, "SELECTIVE": 0, "DEFENSIVE": 7}.get(regime_label or "SELECTIVE", 0)
+
+    if trend == "DOWNTREND":
+        action = "SELL" if (conviction < 45 or (macd_bear and weak_mom)) else "HOLD"
+    elif stage_id == 4:
+        action = "REDUCE" if conviction >= 55 else "SELL"
+    elif trend == "PULLBACK":
+        if conviction >= 65 + shift:
+            action = "ACCUMULATE"      # quality name resting on/under MA50
+        elif macd_bear and weak_mom and conviction < 45:
+            action = "SELL"
+        else:
+            action = "HOLD"
+    else:  # UPTREND / RECOVERY / UNKNOWN
+        if conviction >= 80 + shift and not critical_bear:
+            action = "STRONG_BUY"
+        elif conviction >= 65 + shift:
+            action = "BUY"
+        elif conviction >= 50 + shift:
+            action = "ACCUMULATE"
+        elif conviction >= 35:
+            action = "HOLD"
+        else:
+            action = "AVOID"
 
     # Entry / stop / targets
     atrp_use = atrp if (isinstance(atrp, (int, float)) and np.isfinite(atrp) and atrp > 0) else 3.0
     price_v = price if (isinstance(price, (int, float)) and np.isfinite(price) and price > 0) else None
     entry_low  = round(price_v * (1 - 0.5 * atrp_use / 100), 2) if price_v else None
     entry_high = round(price_v, 2) if price_v else None
-    stop       = round(price_v * (1 - 2 * atrp_use / 100), 2) if price_v else None
+
+    # Structure-aware stop: 2.2×ATR below price, tightened to 3% under MA50
+    # when price rides above it; never closer than 3% to the entry.
+    stop = None
+    if price_v:
+        cands = [price_v * (1 - 2.2 * atrp_use / 100)]
+        if _fin(ma50) and 0 < ma50 < price_v:
+            cands.append(ma50 * 0.97)
+        stop = round(min(max(cands), price_v * 0.97), 2)
 
     targets = {}
     def _add_target(name, v):
@@ -2291,8 +2344,36 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
     _add_target("analyst_mean", metrics.get("target_mean"))
     _add_target("dcf",          (metrics.get("dcf") or {}).get("intrinsic_per_share"))
 
+    # Tiered plan: T1 = ~1.5 ATR swing target, T2 = nearest structural target
+    # above T1, T3 = most ambitious validated target. Kept monotonic so the
+    # ladder always reads T1 < T2 < T3.
+    tiers = {}
+    risk_reward = None
+    if price_v:
+        t1 = price_v * (1 + 1.5 * atrp_use / 100)
+        structural = sorted(targets.values())
+        t2 = next((t for t in structural if t > t1 * 1.01), None) or price_v * 1.12
+        t3 = max([t2] + [t for t in structural if t < price_v * 3])
+        t1 = min(t1, t2 * 0.99)
+        tiers = {"T1": round(t1, 2), "T2": round(t2, 2), "T3": round(t3, 2)}
+        if stop is not None and price_v > stop:
+            risk_reward = round((t2 - price_v) / (price_v - stop), 2)
+
+    # Reliability gate: a fresh BUY must clear ~1.8× reward-to-risk, otherwise
+    # it is only worth scaling into.
+    if risk_reward is not None and risk_reward < 1.8 and action in ("STRONG_BUY", "BUY"):
+        action = "ACCUMULATE"
+
+    holder_map = {
+        "STRONG_BUY": "HOLD / ADD", "BUY": "HOLD / ADD", "ACCUMULATE": "HOLD",
+        "HOLD": "HOLD", "REDUCE": "TRIM 25–50%", "SELL": "EXIT",
+        "AVOID": "EXIT ON STRENGTH",
+    }
+
     return {
         "action": action,
+        "holder_action": holder_map.get(action, "HOLD"),
+        "trend": trend,
         "conviction": conviction,
         "scores": {
             "technical": round(tech_score, 1),
@@ -2305,6 +2386,8 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
         "entry_zone": (entry_low, entry_high),
         "stop_loss": stop,
         "targets": targets,
+        "tiers": tiers,
+        "risk_reward": risk_reward,
     }
 
 def analyze_stock_fundamentals(symbol: str, technicals_row: dict) -> dict:
@@ -2329,7 +2412,10 @@ def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
         "Stage": t.get("Stage"),
         "Score": t.get("Score"),
         "Action": rec.get("action"),
+        "Holder Action": rec.get("holder_action"),
+        "Trend": rec.get("trend"),
         "Conviction": rec.get("conviction"),
+        "Risk:Reward": rec.get("risk_reward"),
         "Upside % (tech)": t.get("Upside %"),
         "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
         "DCF Upside %": dcf.get("upside_pct"),
@@ -2416,9 +2502,12 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 "Target High ₹": m.get("target_high"),
                 "Target Low ₹":  m.get("target_low"),
             })
+            tiers = rec.get("tiers") or {}
             rows_rec.append({
                 "Ticker": ticker_no,
                 "Action": rec.get("action"),
+                "Holder Action": rec.get("holder_action"),
+                "Trend": rec.get("trend"),
                 "Conviction": rec.get("conviction"),
                 "Tech Score": rec.get("scores", {}).get("technical"),
                 "Quality Score": rec.get("scores", {}).get("quality"),
@@ -2427,7 +2516,11 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 "Entry Low": rec.get("entry_zone", (None, None))[0],
                 "Entry High": rec.get("entry_zone", (None, None))[1],
                 "Stop Loss": rec.get("stop_loss"),
-                "Target Fib": rec.get("targets", {}).get("fib"),
+                "Risk:Reward": rec.get("risk_reward"),
+                "Target T1": tiers.get("T1"),
+                "Target T2": tiers.get("T2"),
+                "Target T3": tiers.get("T3"),
+                "Target Technical": rec.get("targets", {}).get("technical"),
                 "Target Analyst": rec.get("targets", {}).get("analyst_mean"),
                 "Target DCF": rec.get("targets", {}).get("dcf"),
                 "Bull Case": " | ".join(rec.get("bull_case", [])),
@@ -2786,11 +2879,9 @@ def _run_pipeline(cb=None) -> dict:
             m    = raw_funds.get(sym, {})
             tech = t_row.to_dict()
             try:
-                rec = recommend_action(m, tech)
+                rec = recommend_action(m, tech, regime.get("label", "SELECTIVE"))
             except Exception as e:
-                rec = {"action": "HOLD", "conviction": 0, "scores": {},
-                       "bull_case": [f"Recommender error: {e}"], "bear_case": [],
-                       "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+                rec = _recommend_action_safe_stub(str(e))
             fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
 
     return {
@@ -2921,8 +3012,10 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
     # Recommendation card
     action = rec.get("action", "—")
     color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
-                 "HOLD":"#8896b3","AVOID":"#f87171"}
+                 "HOLD":"#8896b3","REDUCE":"#f59e0b","SELL":"#f87171","AVOID":"#f87171"}
     ac_color = color_map.get(action, "#8896b3")
+    rr = rec.get("risk_reward")
+    rr_s = f"{rr:.1f}" if isinstance(rr, (int, float)) and np.isfinite(rr) else "—"
     st.markdown(f"""
     <div class="pick-card" style="margin-top:10px;border-left:3px solid {ac_color}">
         <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
@@ -2931,6 +3024,15 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
             </span>
             <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
                 Conviction <strong style="color:#f0c96a;font-size:1.1rem">{rec.get('conviction','—')}</strong> / 100
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                Trend <strong style="color:#eef2ff">{rec.get('trend','—')}</strong>
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                If holding <strong style="color:#eef2ff">{rec.get('holder_action','—')}</strong>
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                R:R <strong style="color:#eef2ff">{rr_s}</strong>
             </span>
         </div>
     </div>
@@ -3026,6 +3128,13 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
             st.markdown("**Bear case**")
             for b in rec.get("bear_case", []):
                 st.markdown(f"- {b}")
+        tiers = rec.get("tiers") or {}
+        if tiers:
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            tc1.metric("T1 · Swing",   _num(tiers.get("T1"), prefix="₹"))
+            tc2.metric("T2 · Core",    _num(tiers.get("T2"), prefix="₹"))
+            tc3.metric("T3 · Stretch", _num(tiers.get("T3"), prefix="₹"))
+            tc4.metric("Risk : Reward", rr_s)
         ez = rec.get("entry_zone", (None, None))
         e1, e2, e3 = st.columns(3)
         e1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
@@ -3313,11 +3422,10 @@ if "strategy" in st.session_state:
                     st.warning(f"No usable price data for {picked_symbol}. The symbol may be delisted, suspended, or too thinly traded.")
                 else:
                     try:
-                        rec = recommend_action(metrics, tech_row)
+                        rec = recommend_action(metrics, tech_row,
+                                               (regime or {}).get("label", "SELECTIVE"))
                     except Exception as e:
-                        rec = {"action": "HOLD", "conviction": 0, "scores": {},
-                               "bull_case": [f"Recommender error: {e}"], "bear_case": [],
-                               "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+                        rec = _recommend_action_safe_stub(str(e))
                     in_shortlist = (shortlist_df is not None and not shortlist_df.empty
                                     and picked_symbol in set(shortlist_df["Ticker"].astype(str)))
                     ctx_label = "Ad-hoc lookup · in shortlist" if in_shortlist else "Ad-hoc lookup · not in shortlist"
