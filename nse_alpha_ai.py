@@ -7,6 +7,7 @@ import uuid
 import time
 import math
 import pickle
+import sqlite3
 import logging
 import warnings
 import threading
@@ -253,6 +254,8 @@ CHUNK_SIZE         = 80
 MAX_DISPLAY_STOCKS = 12
 RSI_PERIOD         = 14
 RSI_OVERBOUGHT     = 72   # stocks above this are excluded from Top 3 picks
+MIN_PRICE          = 10.0 # ₹ — skip penny names in the market scan
+MIN_TURNOVER_CR    = 2.0  # ₹ crore — min 20d avg daily traded value
 
 # ── Rally classifier / shortlist ────────────────────────────────────
 SHORTLIST_TARGET     = 25
@@ -705,9 +708,11 @@ def get_nse_registry() -> pd.DataFrame:
 # =============================
 
 def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> float:
+    # Wilder smoothing (ewm alpha=1/period), matching the standard RSI used by
+    # charting platforms — the plain rolling mean overstates extremes.
     delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    gain  = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
     rs    = gain / loss.replace(0, np.nan)
     rsi   = 100 - (100 / (1 + rs))
     return round(float(rsi.iloc[-1]), 1) if not rsi.empty else np.nan
@@ -865,6 +870,22 @@ def dist_from_ma(price: float, ma: float) -> float:
     if not ma or ma <= 0 or not np.isfinite(price) or not np.isfinite(ma):
         return np.nan
     return round((price / ma - 1) * 100, 2)
+
+def weekly_uptrend(close: pd.Series) -> bool | None:
+    """Higher-timeframe confirmation: True when the weekly close sits above a
+    rising 10-week MA, False when it doesn't, None when there's not enough
+    history to judge. Filters daily-only noise out of fresh-buy conviction."""
+    try:
+        w = close.resample("W").last().dropna()
+        if len(w) < 12:
+            return None
+        ma10 = w.rolling(10).mean()
+        if not (np.isfinite(ma10.iloc[-1]) and np.isfinite(ma10.iloc[-3])):
+            return None
+        return bool(float(w.iloc[-1]) > float(ma10.iloc[-1])
+                    and float(ma10.iloc[-1]) >= float(ma10.iloc[-3]))
+    except Exception:
+        return None
 
 # =============================
 # RALLY STAGE CLASSIFIER
@@ -1486,9 +1507,20 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                 vol_avg   = float(df["Volume"].iloc[-(VOL_LOOKBACK + 1):-1].mean())
                 vol_now   = float(df["Volume"].iloc[-1])
                 vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
+
+                # Liquidity + data-sanity guard: skip penny / thinly-traded
+                # names (targets and stops are meaningless against wide
+                # spreads) and bars with glitch-sized single-day moves.
+                turnover_cr = price * vol_avg / 1e7
+                if price < MIN_PRICE or turnover_cr < MIN_TURNOVER_CR:
+                    continue
+                if (close.pct_change(fill_method=None).iloc[-5:].abs() > 0.35).any():
+                    continue
+
                 rsi       = compute_rsi(close)
                 atr_pct   = compute_atr_pct(df)
                 upside    = estimate_upside(df, price, high20)
+                wk_up     = weekly_uptrend(close)
 
                 macd_last, sig_last, hist_last, hist_series = compute_macd(close)
                 macd_above_signal = bool(np.isfinite(macd_last) and np.isfinite(sig_last) and macd_last > sig_last)
@@ -1564,6 +1596,8 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                     "Upside %"     : upside["upside_pct"],
                     "52W High ₹"   : upside["high52"],
                     "Gap to 52W %" : upside["high52_gap_pct"],
+                    "Weekly Up"    : wk_up,
+                    "Turnover ₹Cr" : round(turnover_cr, 2),
                     "Pattern"      : pat.get("name"),
                     "Pattern Q"    : pat.get("quality"),
                     "New 52W High" : bool(upside.get("high52_gap_pct") is not None
@@ -1703,6 +1737,9 @@ def compute_single_stock_technicals(symbol_yf: str, _nifty_hash: int = 0) -> dic
     row["Pattern Q"]    = pat.get("quality")
     row["New 52W High"] = bool(upside.get("high52_gap_pct") is not None
                                and abs(upside["high52_gap_pct"]) < 0.5)
+    row["Weekly Up"]    = weekly_uptrend(close)
+    turnover_cr = price * vol_avg / 1e7 if vol_avg else np.nan
+    row["Turnover ₹Cr"] = round(turnover_cr, 2) if np.isfinite(turnover_cr) else np.nan
     # Single-row score via the same composite engine (with std fallback).
     scored = compute_composite_score(pd.DataFrame([row]))
     row["Score"] = float(scored.iloc[0]["Score"]) if not scored.empty else np.nan
@@ -1750,7 +1787,18 @@ def compute_composite_score(df: pd.DataFrame) -> pd.DataFrame:
         0.10 * rs_w    +
         0.05 * up_w
     )
-    d["Score"] = score.round(1)
+    # Higher-timeframe nudge: weekly close above a rising 10-wk MA earns +4,
+    # a confirmed weekly downtrend costs 6, unknown leaves the score as-is.
+    if "Weekly Up" in d.columns:
+        def _wk_adj(v):
+            try:
+                if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                    return 0.0
+                return 4.0 if bool(v) else -6.0
+            except Exception:
+                return 0.0
+        score = score + d["Weekly Up"].apply(_wk_adj)
+    d["Score"] = score.clip(0, 100).round(1)
     return d
 
 def attach_rs_rank(df: pd.DataFrame) -> pd.DataFrame:
@@ -1924,6 +1972,34 @@ def compute_dcf(info: dict, cashflow: pd.DataFrame, balance: pd.DataFrame) -> di
     })
     return out
 
+def _parse_next_earnings(cal) -> str | None:
+    """Extract the next upcoming earnings date (ISO yyyy-mm-dd) from yfinance
+    `Ticker.calendar`, which is a dict in recent versions and a DataFrame in
+    older ones. Returns None when no future date is found."""
+    try:
+        dates = []
+        if isinstance(cal, dict):
+            v = cal.get("Earnings Date") or cal.get("EarningsDate")
+            if v is not None:
+                dates = list(v) if isinstance(v, (list, tuple)) else [v]
+        elif cal is not None and hasattr(cal, "index"):
+            for lbl in cal.index:
+                if "earnings" in str(lbl).lower():
+                    dates = [d for d in cal.loc[lbl].tolist() if d is not None]
+                    break
+        today = now_ist().date()
+        future = []
+        for d in dates:
+            try:
+                dd = pd.Timestamp(d).date()
+                if dd >= today:
+                    future.append(dd)
+            except Exception:
+                continue
+        return min(future).isoformat() if future else None
+    except Exception:
+        return None
+
 @st.cache_data(ttl=FUND_CACHE_TTL_SEC, show_spinner=False)
 def fetch_fundamentals(symbol: str) -> dict:
     """Pull FMP-equivalent fundamentals from yfinance for a single ticker."""
@@ -1937,6 +2013,7 @@ def fetch_fundamentals(symbol: str) -> dict:
         eh   = _safe(lambda: t.earnings_history, default=pd.DataFrame())
         rec  = _safe(lambda: t.recommendations_summary, default=pd.DataFrame())
         news = _safe(lambda: t.news, default=[]) or []
+        out["next_earnings"] = _parse_next_earnings(_safe(lambda: t.calendar, default=None))
     except Exception as e:
         out["error"] = str(e)
         return out
@@ -2117,26 +2194,31 @@ def _coalesce(v, default):
         return default
 
 def _recommend_action_safe_stub(reason: str = "unknown error") -> dict:
-    return {"action": "HOLD", "conviction": 0,
+    return {"action": "HOLD", "holder_action": "HOLD", "trend": "UNKNOWN",
+            "conviction": 0,
             "scores": {"technical": 0, "quality": 0, "value": 0, "growth": 0},
             "bull_case": [f"Recommender unavailable: {reason}"],
             "bear_case": ["Insufficient data to score"],
-            "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+            "entry_zone": (None, None), "stop_loss": None, "targets": {},
+            "tiers": {}, "risk_reward": None, "earnings_in_days": None}
 
-def recommend_action(metrics: dict, tech: dict) -> dict:
+def recommend_action(metrics: dict, tech: dict, regime_label: str | None = None) -> dict:
     """
     metrics = fundamentals dict from fetch_fundamentals.
     tech    = single-stock row from the momentum scan (Score, Stage, ATR %, RSI, ADX, RS, Upside %, etc.).
-    Returns {action, conviction, bull_case, bear_case, entry_zone, stop_loss, targets}.
+    regime_label = optional market-regime label (AGGRESSIVE/SELECTIVE/DEFENSIVE)
+    that shifts the conviction thresholds for fresh buys.
+    Returns {action, holder_action, trend, conviction, bull_case, bear_case,
+    entry_zone, stop_loss, targets, tiers, risk_reward}.
     Wrapped in a top-level try/except so an unexpected per-stock edge case
     can never blank out the Deep Dive card — we degrade to the HOLD stub.
     """
     try:
-        return _recommend_action_impl(metrics, tech)
+        return _recommend_action_impl(metrics, tech, regime_label)
     except Exception as e:
         return _recommend_action_safe_stub(str(e))
 
-def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
+def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None = None) -> dict:
     price = _coalesce(tech.get("Price ₹"), _coalesce(metrics.get("price"), 0))
     atrp  = _coalesce(tech.get("ATR %"), 3.0)
     try:
@@ -2242,6 +2324,8 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
               lambda: "Operating margin < 5%"),
         _flag(lambda: _lt(dcf_up, -20),
               lambda: f"DCF says overvalued ({dcf_up:.0f}%)"),
+        _flag(lambda: tech.get("Weekly Up") == False,   # None/NaN must NOT match
+              lambda: "Weekly timeframe trend is down"),
     ]
     bear = [b for b in bear_candidates if b]
 
@@ -2257,25 +2341,71 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
         or stage_id == 4
     )
 
-    if stage_id == 4:
-        action = "AVOID"
-    elif conviction >= 80 and not critical_bear:
-        action = "STRONG_BUY"
-    elif conviction >= 65:
-        action = "BUY"
-    elif conviction >= 50:
-        action = "ACCUMULATE"
-    elif conviction >= 35:
-        action = "HOLD"
+    # ── Trend state (price vs MA50/MA200) — drives holder vs new-money calls ──
+    def _fin(v):
+        return isinstance(v, (int, float)) and np.isfinite(v)
+
+    ma50      = _coalesce(tech.get("MA50"), None)
+    ma200     = _coalesce(tech.get("MA200"), None)
+    macd_hist = _coalesce(tech.get("MACD Hist"), None)
+    rsi_v     = _coalesce(tech.get("RSI"), None)
+
+    if _fin(price) and _fin(ma200):
+        if _fin(ma50) and price > ma50 and ma50 > ma200:
+            trend = "UPTREND"
+        elif price < ma200:
+            trend = "DOWNTREND"
+        elif _fin(ma50) and price < ma50:
+            trend = "PULLBACK"
+        else:
+            trend = "RECOVERY"
     else:
-        action = "AVOID"
+        trend = "UNKNOWN"
+
+    macd_bear = bool(_fin(macd_hist) and macd_hist < 0)
+    weak_mom  = bool(_fin(rsi_v) and rsi_v < 45)
+
+    # Regime-aware thresholds: demand more conviction in a DEFENSIVE tape,
+    # slightly less in an AGGRESSIVE one.
+    shift = {"AGGRESSIVE": -5, "SELECTIVE": 0, "DEFENSIVE": 7}.get(regime_label or "SELECTIVE", 0)
+
+    if trend == "DOWNTREND":
+        action = "SELL" if (conviction < 45 or (macd_bear and weak_mom)) else "HOLD"
+    elif stage_id == 4:
+        action = "REDUCE" if conviction >= 55 else "SELL"
+    elif trend == "PULLBACK":
+        if conviction >= 65 + shift:
+            action = "ACCUMULATE"      # quality name resting on/under MA50
+        elif macd_bear and weak_mom and conviction < 45:
+            action = "SELL"
+        else:
+            action = "HOLD"
+    else:  # UPTREND / RECOVERY / UNKNOWN
+        if conviction >= 80 + shift and not critical_bear:
+            action = "STRONG_BUY"
+        elif conviction >= 65 + shift:
+            action = "BUY"
+        elif conviction >= 50 + shift:
+            action = "ACCUMULATE"
+        elif conviction >= 35:
+            action = "HOLD"
+        else:
+            action = "AVOID"
 
     # Entry / stop / targets
     atrp_use = atrp if (isinstance(atrp, (int, float)) and np.isfinite(atrp) and atrp > 0) else 3.0
     price_v = price if (isinstance(price, (int, float)) and np.isfinite(price) and price > 0) else None
     entry_low  = round(price_v * (1 - 0.5 * atrp_use / 100), 2) if price_v else None
     entry_high = round(price_v, 2) if price_v else None
-    stop       = round(price_v * (1 - 2 * atrp_use / 100), 2) if price_v else None
+
+    # Structure-aware stop: 2.2×ATR below price, tightened to 3% under MA50
+    # when price rides above it; never closer than 3% to the entry.
+    stop = None
+    if price_v:
+        cands = [price_v * (1 - 2.2 * atrp_use / 100)]
+        if _fin(ma50) and 0 < ma50 < price_v:
+            cands.append(ma50 * 0.97)
+        stop = round(min(max(cands), price_v * 0.97), 2)
 
     targets = {}
     def _add_target(name, v):
@@ -2291,8 +2421,54 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
     _add_target("analyst_mean", metrics.get("target_mean"))
     _add_target("dcf",          (metrics.get("dcf") or {}).get("intrinsic_per_share"))
 
+    # Tiered plan: T1 = ~1.5 ATR swing target, T2 = nearest structural target
+    # above T1, T3 = most ambitious validated target. Kept monotonic so the
+    # ladder always reads T1 < T2 < T3.
+    tiers = {}
+    risk_reward = None
+    if price_v:
+        t1 = price_v * (1 + 1.5 * atrp_use / 100)
+        structural = sorted(targets.values())
+        t2 = next((t for t in structural if t > t1 * 1.01), None) or price_v * 1.12
+        t3 = max([t2] + [t for t in structural if t < price_v * 3])
+        t1 = min(t1, t2 * 0.99)
+        tiers = {"T1": round(t1, 2), "T2": round(t2, 2), "T3": round(t3, 2)}
+        if stop is not None and price_v > stop:
+            risk_reward = round((t2 - price_v) / (price_v - stop), 2)
+
+    # Reliability gate: a fresh BUY must clear ~1.8× reward-to-risk, otherwise
+    # it is only worth scaling into.
+    if risk_reward is not None and risk_reward < 1.8 and action in ("STRONG_BUY", "BUY"):
+        action = "ACCUMULATE"
+
+    # Higher-timeframe veto: a confirmed weekly downtrend caps fresh
+    # conviction at BUY (None/NaN — unknown — must NOT trigger this).
+    if tech.get("Weekly Up") == False and action == "STRONG_BUY":
+        action = "BUY"
+
+    # Earnings-gap guard: a stop can't protect through an overnight results
+    # gap, so fresh entries within 3 days of earnings wait for the print.
+    earnings_in_days = None
+    try:
+        ne = metrics.get("next_earnings")
+        if ne:
+            earnings_in_days = (datetime.fromisoformat(str(ne)).date() - now_ist().date()).days
+            if 0 <= earnings_in_days <= 3 and action in ("STRONG_BUY", "BUY", "ACCUMULATE"):
+                action = "HOLD"
+                bear_case = ([f"Earnings in {earnings_in_days}d — fresh entry deferred"] + bear_case)[:3]
+    except Exception:
+        earnings_in_days = None
+
+    holder_map = {
+        "STRONG_BUY": "HOLD / ADD", "BUY": "HOLD / ADD", "ACCUMULATE": "HOLD",
+        "HOLD": "HOLD", "REDUCE": "TRIM 25–50%", "SELL": "EXIT",
+        "AVOID": "EXIT ON STRENGTH",
+    }
+
     return {
         "action": action,
+        "holder_action": holder_map.get(action, "HOLD"),
+        "trend": trend,
         "conviction": conviction,
         "scores": {
             "technical": round(tech_score, 1),
@@ -2305,6 +2481,9 @@ def _recommend_action_impl(metrics: dict, tech: dict) -> dict:
         "entry_zone": (entry_low, entry_high),
         "stop_loss": stop,
         "targets": targets,
+        "tiers": tiers,
+        "risk_reward": risk_reward,
+        "earnings_in_days": earnings_in_days,
     }
 
 def analyze_stock_fundamentals(symbol: str, technicals_row: dict) -> dict:
@@ -2312,6 +2491,365 @@ def analyze_stock_fundamentals(symbol: str, technicals_row: dict) -> dict:
     metrics = fetch_fundamentals(symbol)
     rec     = recommend_action(metrics, technicals_row)
     return {"symbol": symbol, "metrics": metrics, "technicals": technicals_row, "recommendation": rec}
+
+# =============================
+# SCAN HISTORY + FORWARD-RETURN VALIDATION
+# Every completed scan is appended to a local SQLite DB so the tool has
+# memory: signal aging, action-change tracking, and an evidence-based
+# validation report (what actually happened after past signals).
+# NOTE: on Streamlit Cloud this file survives reruns but NOT app reboots;
+# point NSE_HISTORY_DIR at persistent storage for durable history.
+# =============================
+
+HIST_DIR = Path(os.environ.get("NSE_HISTORY_DIR", str(Path(__file__).parent / "data")))
+try:
+    HIST_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    HIST_DIR = Path(tempfile.gettempdir()) / "nse_alpha_history"
+    HIST_DIR.mkdir(parents=True, exist_ok=True)
+HIST_DB = HIST_DIR / "scan_history.db"
+
+def _hist_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(HIST_DB), timeout=10)
+    conn.execute("""CREATE TABLE IF NOT EXISTS scans (
+        scan_id TEXT PRIMARY KEY, ts_ist TEXT,
+        regime TEXT, regime_score REAL, n_signals INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS signals (
+        scan_id TEXT, ts_ist TEXT, ticker TEXT, price REAL,
+        stage_id INTEGER, stage TEXT, score REAL, grade TEXT, rs_rank REAL,
+        rsi REAL, adx REAL, atr_pct REAL,
+        action TEXT, conviction REAL, entry_low REAL, entry_high REAL,
+        stop REAL, t1 REAL, t2 REAL, t3 REAL,
+        PRIMARY KEY (scan_id, ticker))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS positions (
+        ticker TEXT PRIMARY KEY, buy_price REAL, qty REAL,
+        buy_date TEXT, added_at TEXT)""")
+    return conn
+
+def _f_or_none(v):
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else None
+    except Exception:
+        return None
+
+def save_scan_snapshot(result: dict) -> None:
+    """Persist one scan's signals (plus shortlist recommendations) to the
+    history DB. Fully defensive — a storage failure never breaks the scan."""
+    try:
+        mdf = result.get("momentum_df")
+        if mdf is None or mdf.empty:
+            return
+        ts       = result.get("last_run") or now_ist()
+        scan_id  = ts.strftime("%Y%m%d_%H%M%S")
+        ts_iso   = ts.isoformat()
+        regime   = result.get("regime") or {}
+        fund_map = result.get("fund_map") or {}
+        rows = []
+        for _, r in mdf.iterrows():
+            rec   = (fund_map.get(f"{r['Ticker']}.NS") or {}).get("recommendation") or {}
+            tiers = rec.get("tiers") or {}
+            ez    = rec.get("entry_zone") or (None, None)
+            rows.append((
+                scan_id, ts_iso, str(r["Ticker"]),
+                _f_or_none(r.get("Price ₹")),
+                int(_f_or_none(r.get("StageId")) or 0), str(r.get("Stage") or ""),
+                _f_or_none(r.get("Score")), str(r.get("Grade") or ""), _f_or_none(r.get("RS Rank")),
+                _f_or_none(r.get("RSI")), _f_or_none(r.get("ADX")), _f_or_none(r.get("ATR %")),
+                rec.get("action"), _f_or_none(rec.get("conviction")),
+                _f_or_none(ez[0]), _f_or_none(ez[1]),
+                _f_or_none(rec.get("stop_loss")),
+                _f_or_none(tiers.get("T1")), _f_or_none(tiers.get("T2")), _f_or_none(tiers.get("T3")),
+            ))
+        with _hist_conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO scans VALUES (?,?,?,?,?)",
+                         (scan_id, ts_iso, regime.get("label"),
+                          _f_or_none(regime.get("score")), len(rows)))
+            conn.executemany(
+                "INSERT OR REPLACE INTO signals VALUES (" + ",".join(["?"] * 20) + ")", rows)
+    except Exception:
+        pass
+
+def load_scan_history(days: int = 180) -> tuple:
+    """Return (scans_df, signals_df) within the lookback window."""
+    try:
+        if not HIST_DB.exists():
+            return pd.DataFrame(), pd.DataFrame()
+        with _hist_conn() as conn:
+            scans = pd.read_sql_query("SELECT * FROM scans ORDER BY ts_ist", conn)
+            sigs  = pd.read_sql_query("SELECT * FROM signals", conn)
+        if scans.empty:
+            return scans, sigs
+        cutoff = (now_ist() - timedelta(days=days)).isoformat()
+        scans  = scans[scans["ts_ist"] >= cutoff]
+        sigs   = sigs[sigs["scan_id"].isin(set(scans["scan_id"]))]
+        return scans.reset_index(drop=True), sigs.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+def build_signal_tracker(scans: pd.DataFrame, sigs: pd.DataFrame) -> pd.DataFrame:
+    """Per-ticker signal aging + action change vs the previous scan."""
+    if scans.empty or sigs.empty:
+        return pd.DataFrame()
+    s = sigs.copy()
+    s["date"] = s["ts_ist"].str[:10]
+    ids = sorted(scans["scan_id"].unique())
+    cur_id  = ids[-1]
+    prev_id = ids[-2] if len(ids) >= 2 else None
+
+    g = s.groupby("ticker")
+    out = pd.DataFrame({
+        "First Seen": g["date"].min(),
+        "Last Seen":  g["date"].max(),
+        "Scans":      g["scan_id"].nunique(),
+    })
+    cur = s[s["scan_id"] == cur_id].drop_duplicates("ticker").set_index("ticker")
+    out["Stage"]  = cur["stage"]
+    out["Score"]  = cur["score"]
+    out["Action"] = cur["action"]
+
+    if prev_id:
+        prev = s[s["scan_id"] == prev_id].drop_duplicates("ticker").set_index("ticker")
+        deltas = []
+        for t in out.index:
+            in_cur, in_prev = t in cur.index, t in prev.index
+            if in_cur and not in_prev:
+                deltas.append("NEW")
+            elif in_prev and not in_cur:
+                deltas.append("DROPPED")
+            elif not in_cur:
+                deltas.append("STALE")
+            else:
+                a_cur  = cur.at[t, "action"] or ""
+                a_prev = prev.at[t, "action"] or ""
+                deltas.append("UNCHANGED" if a_cur == a_prev
+                              else f"{a_prev or '—'} → {a_cur or '—'}")
+        out["Δ vs Prev Scan"] = deltas
+
+    out = out.reset_index().rename(columns={"ticker": "Ticker"})
+    return out.sort_values(["Last Seen", "Scans"], ascending=[False, False]).reset_index(drop=True)
+
+def run_validation_report(min_age_days: int = 3, horizons: tuple = (5, 10, 20),
+                          max_signals: int = 1500) -> dict:
+    """Score stored past signals against what prices actually did.
+    Returns aggregate hit-rate tables by action / stage / grade."""
+    out = {"error": None, "n_scans": 0, "n_signals": 0}
+    scans, sigs = load_scan_history(days=365)
+    if scans.empty or sigs.empty:
+        out["error"] = ("No stored scan history yet. Every completed scan is now saved "
+                        "automatically — run scans on different days, then validate.")
+        return out
+    cutoff = (now_ist() - timedelta(days=min_age_days)).isoformat()
+    eligible = scans[scans["ts_ist"] < cutoff]
+    if eligible.empty:
+        out["error"] = f"History exists but no scan is older than {min_age_days} days yet."
+        return out
+    sigs = sigs[sigs["scan_id"].isin(set(eligible["scan_id"]))].copy()
+    sigs = sigs.dropna(subset=["price"]).sort_values("ts_ist", ascending=False).head(max_signals)
+    if sigs.empty:
+        out["error"] = "No priced signals in the eligible window."
+        return out
+
+    # Batch-fetch close history for every distinct ticker once.
+    closes: dict = {}
+    tickers = sorted(sigs["ticker"].unique())
+    yf_syms = [f"{t}.NS" for t in tickers]
+    for i in range(0, len(yf_syms), 100):
+        chunk = yf_syms[i:i + 100]
+        try:
+            data = _yf_download(chunk, period="1y", interval="1d", group_by="ticker",
+                                threads=True, progress=False, auto_adjust=True)
+        except Exception:
+            continue
+        for sym in chunk:
+            try:
+                df = data[sym] if len(chunk) > 1 else data
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                c = df["Close"].dropna()
+                if c.empty:
+                    continue
+                idx = pd.to_datetime(c.index)
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_localize(None)
+                closes[sym[:-3]] = (idx.normalize().values, c.values.astype(float))
+            except Exception:
+                continue
+
+    rows = []
+    max_h = max(horizons)
+    for _, srow in sigs.iterrows():
+        t = srow["ticker"]
+        if t not in closes:
+            continue
+        dates, cl = closes[t]
+        sig_date = np.datetime64(str(srow["ts_ist"])[:10])
+        pos = int(np.searchsorted(dates, sig_date))
+        if pos >= len(cl):
+            continue
+        p0 = _f_or_none(srow["price"])
+        if not p0 or p0 <= 0:
+            continue
+        row = {"ticker": t,
+               "action": srow["action"] if srow["action"] else "(scan only)",
+               "stage":  srow["stage"] or "—",
+               "grade":  srow["grade"] or "—"}
+        for h in horizons:
+            j = pos + h
+            row[f"ret_{h}d"] = (cl[j] / p0 - 1) * 100 if j < len(cl) else np.nan
+        path = cl[pos: pos + max_h + 1]
+        t1, stop = _f_or_none(srow["t1"]), _f_or_none(srow["stop"])
+        row["t1_hit"]   = bool(t1   and len(path) and np.nanmax(path) >= t1)
+        row["stop_hit"] = bool(stop and len(path) and np.nanmin(path) <= stop)
+        rows.append(row)
+
+    perf = pd.DataFrame(rows)
+    if perf.empty:
+        out["error"] = "Could not match any stored signals to price history."
+        return out
+
+    def _agg(by):
+        g = perf.groupby(by, dropna=False)
+        res = pd.DataFrame({
+            "Signals": g.size(),
+            **{f"Avg {h}d %": g[f"ret_{h}d"].mean().round(2) for h in horizons},
+            **{f"Win {h}d %": g[f"ret_{h}d"].apply(
+                   lambda x: round(float((x.dropna() > 0).mean() * 100), 1)
+                   if x.notna().any() else np.nan)
+               for h in horizons},
+            "T1 Hit %":   (g["t1_hit"].mean() * 100).round(1),
+            "Stop Hit %": (g["stop_hit"].mean() * 100).round(1),
+        }).reset_index().rename(columns={by: by.capitalize()})
+        return res.sort_values("Signals", ascending=False).reset_index(drop=True)
+
+    out.update({
+        "n_scans":   int(eligible["scan_id"].nunique()),
+        "n_signals": len(perf),
+        "by_action": _agg("action"),
+        "by_stage":  _agg("stage"),
+        "by_grade":  _agg("grade"),
+    })
+    return out
+
+def live_shortlist_check(shortlist_df: pd.DataFrame, fund_map: dict) -> pd.DataFrame:
+    """Light price-only refresh of the shortlist: latest price vs scan price,
+    distance to stop / targets, and STOP/T1/T2 HIT flags. No indicators are
+    recomputed — this is a fast intraday sanity check, not a rescan."""
+    if shortlist_df is None or shortlist_df.empty:
+        return pd.DataFrame()
+    syms = [f"{t}.NS" for t in shortlist_df["Ticker"]]
+    try:
+        data = _yf_download(syms, period="5d", interval="1d", group_by="ticker",
+                            threads=True, progress=False, auto_adjust=True)
+    except Exception:
+        return pd.DataFrame()
+    rows = []
+    for _, r in shortlist_df.iterrows():
+        sym = f"{r['Ticker']}.NS"
+        try:
+            df = data[sym] if len(syms) > 1 else data
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            c = df["Close"].dropna()
+            if c.empty:
+                continue
+            last = float(c.iloc[-1])
+        except Exception:
+            continue
+        rec   = (fund_map.get(sym) or {}).get("recommendation") or {}
+        tiers = rec.get("tiers") or {}
+        stop, t1, t2 = rec.get("stop_loss"), tiers.get("T1"), tiers.get("T2")
+        scan_px = _f_or_none(r.get("Price ₹"))
+        status = "OK"
+        if stop and last <= stop:
+            status = "STOP HIT"
+        elif t2 and last >= t2:
+            status = "T2 HIT"
+        elif t1 and last >= t1:
+            status = "T1 HIT"
+        rows.append({
+            "Ticker": r["Ticker"], "Scan ₹": scan_px, "Now ₹": round(last, 2),
+            "Δ %": round((last / scan_px - 1) * 100, 2) if scan_px else None,
+            "Action": rec.get("action"), "Stop ₹": stop, "T1 ₹": t1, "T2 ₹": t2,
+            "To Stop %": round((stop / last - 1) * 100, 1) if stop else None,
+            "To T2 %":   round((t2 / last - 1) * 100, 1) if t2 else None,
+            "Status": status,
+        })
+    return pd.DataFrame(rows)
+
+# =============================
+# PORTFOLIO — user holdings persisted in the history DB, re-evaluated on
+# demand with the exact same engine as Deep Dive. Works with or without a
+# fresh market scan, so hold/trim/exit calls are available at any time.
+# =============================
+
+def load_positions() -> pd.DataFrame:
+    try:
+        if not HIST_DB.exists():
+            return pd.DataFrame()
+        with _hist_conn() as conn:
+            return pd.read_sql_query("SELECT * FROM positions ORDER BY ticker", conn)
+    except Exception:
+        return pd.DataFrame()
+
+def upsert_position(ticker: str, buy_price: float, qty: float, buy_date: str) -> None:
+    try:
+        with _hist_conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?)",
+                         (str(ticker).upper(), float(buy_price), float(qty),
+                          str(buy_date), now_ist().isoformat()))
+    except Exception:
+        pass
+
+def delete_positions(tickers: list) -> None:
+    try:
+        with _hist_conn() as conn:
+            conn.executemany("DELETE FROM positions WHERE ticker = ?",
+                             [(str(t).upper(),) for t in tickers])
+    except Exception:
+        pass
+
+def evaluate_positions(pos_df: pd.DataFrame, regime_label: str | None = None) -> pd.DataFrame:
+    """Re-evaluate every saved position with current technicals + fundamentals.
+    Sequential — portfolios are small and both fetches are cached."""
+    rows = []
+    for _, p in pos_df.iterrows():
+        t   = str(p["ticker"]).upper()
+        sym = f"{t}.NS"
+        try:
+            tech = compute_single_stock_technicals(sym)
+        except Exception:
+            tech = None
+        if not tech:
+            rows.append({"Ticker": t, "Status": "NO DATA"})
+            continue
+        try:
+            metrics = fetch_fundamentals(sym)
+        except Exception:
+            metrics = {}
+        rec    = recommend_action(metrics, tech, regime_label)
+        now_px = _f_or_none(tech.get("Price ₹"))
+        buy    = _f_or_none(p.get("buy_price"))
+        qty    = _f_or_none(p.get("qty")) or 0
+        stop   = rec.get("stop_loss")
+        tiers  = rec.get("tiers") or {}
+        status = "OK"
+        if stop and now_px and now_px <= stop:
+            status = "BELOW STOP"
+        elif rec.get("action") in ("SELL", "REDUCE"):
+            status = "ACTION NEEDED"
+        rows.append({
+            "Ticker": t, "Qty": qty, "Buy ₹": buy, "Now ₹": now_px,
+            "P&L %": round((now_px / buy - 1) * 100, 2) if (buy and now_px) else None,
+            "P&L ₹": round((now_px - buy) * qty, 0) if (buy and now_px and qty) else None,
+            "Trend": rec.get("trend"), "Stage": tech.get("Stage"),
+            "Action": rec.get("action"), "If Holding": rec.get("holder_action"),
+            "Conviction": rec.get("conviction"),
+            "Stop ₹": stop, "T2 ₹": tiers.get("T2"),
+            "Earnings (d)": rec.get("earnings_in_days"),
+            "Status": status,
+        })
+    return pd.DataFrame(rows)
 
 # =============================
 # EXCEL EXPORT
@@ -2329,7 +2867,10 @@ def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
         "Stage": t.get("Stage"),
         "Score": t.get("Score"),
         "Action": rec.get("action"),
+        "Holder Action": rec.get("holder_action"),
+        "Trend": rec.get("trend"),
         "Conviction": rec.get("conviction"),
+        "Risk:Reward": rec.get("risk_reward"),
         "Upside % (tech)": t.get("Upside %"),
         "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
         "DCF Upside %": dcf.get("upside_pct"),
@@ -2343,6 +2884,7 @@ def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
         "Rev CAGR 3Y %": (m.get("rev_cagr_3y") or 0) * 100 if m.get("rev_cagr_3y") is not None else None,
         "Inst Hold %": (m.get("institutional_held") or 0) * 100 if m.get("institutional_held") is not None else None,
         "Analyst Rec": m.get("recommendation_key"),
+        "Next Earnings": m.get("next_earnings"),
     }
 
 def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund_map: dict) -> bytes:
@@ -2416,9 +2958,12 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 "Target High ₹": m.get("target_high"),
                 "Target Low ₹":  m.get("target_low"),
             })
+            tiers = rec.get("tiers") or {}
             rows_rec.append({
                 "Ticker": ticker_no,
                 "Action": rec.get("action"),
+                "Holder Action": rec.get("holder_action"),
+                "Trend": rec.get("trend"),
                 "Conviction": rec.get("conviction"),
                 "Tech Score": rec.get("scores", {}).get("technical"),
                 "Quality Score": rec.get("scores", {}).get("quality"),
@@ -2427,7 +2972,11 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 "Entry Low": rec.get("entry_zone", (None, None))[0],
                 "Entry High": rec.get("entry_zone", (None, None))[1],
                 "Stop Loss": rec.get("stop_loss"),
-                "Target Fib": rec.get("targets", {}).get("fib"),
+                "Risk:Reward": rec.get("risk_reward"),
+                "Target T1": tiers.get("T1"),
+                "Target T2": tiers.get("T2"),
+                "Target T3": tiers.get("T3"),
+                "Target Technical": rec.get("targets", {}).get("technical"),
                 "Target Analyst": rec.get("targets", {}).get("analyst_mean"),
                 "Target DCF": rec.get("targets", {}).get("dcf"),
                 "Bull Case": " | ".join(rec.get("bull_case", [])),
@@ -2786,14 +3335,12 @@ def _run_pipeline(cb=None) -> dict:
             m    = raw_funds.get(sym, {})
             tech = t_row.to_dict()
             try:
-                rec = recommend_action(m, tech)
+                rec = recommend_action(m, tech, regime.get("label", "SELECTIVE"))
             except Exception as e:
-                rec = {"action": "HOLD", "conviction": 0, "scores": {},
-                       "bull_case": [f"Recommender error: {e}"], "bear_case": [],
-                       "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+                rec = _recommend_action_safe_stub(str(e))
             fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
 
-    return {
+    result = {
         "momentum_df":     momentum_df,
         "shortlist_df":    shortlist_df,
         "early_rally_df":  early_rally_df,
@@ -2806,6 +3353,10 @@ def _run_pipeline(cb=None) -> dict:
         "strategy":        strategy,
         "last_run":        now_ist(),
     }
+
+    _step("save", 98, 100, "Saving scan snapshot to history DB")
+    save_scan_snapshot(result)
+    return result
 
 # =============================
 # RUN BUTTON
@@ -2918,11 +3469,18 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
     hcol3.metric("Stage", tech_row.get("Stage", "—"))
     hcol4.metric("Score", _num(tech_row.get("Score"), decimals=1))
 
+    tcr = tech_row.get("Turnover ₹Cr")
+    if isinstance(tcr, (int, float)) and np.isfinite(tcr) and tcr < MIN_TURNOVER_CR:
+        st.warning(f"Low liquidity: avg daily turnover ₹{tcr:.2f} Cr (below ₹{MIN_TURNOVER_CR:.0f} Cr) "
+                   f"— wide spreads and slippage likely; targets and stops are less dependable here.")
+
     # Recommendation card
     action = rec.get("action", "—")
     color_map = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
-                 "HOLD":"#8896b3","AVOID":"#f87171"}
+                 "HOLD":"#8896b3","REDUCE":"#f59e0b","SELL":"#f87171","AVOID":"#f87171"}
     ac_color = color_map.get(action, "#8896b3")
+    rr = rec.get("risk_reward")
+    rr_s = f"{rr:.1f}" if isinstance(rr, (int, float)) and np.isfinite(rr) else "—"
     st.markdown(f"""
     <div class="pick-card" style="margin-top:10px;border-left:3px solid {ac_color}">
         <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
@@ -2931,6 +3489,15 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
             </span>
             <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
                 Conviction <strong style="color:#f0c96a;font-size:1.1rem">{rec.get('conviction','—')}</strong> / 100
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                Trend <strong style="color:#eef2ff">{rec.get('trend','—')}</strong>
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                If holding <strong style="color:#eef2ff">{rec.get('holder_action','—')}</strong>
+            </span>
+            <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                R:R <strong style="color:#eef2ff">{rr_s}</strong>
             </span>
         </div>
     </div>
@@ -3026,6 +3593,19 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
             st.markdown("**Bear case**")
             for b in rec.get("bear_case", []):
                 st.markdown(f"- {b}")
+        if rec.get("earnings_in_days") is not None:
+            ed = rec["earnings_in_days"]
+            if 0 <= ed <= 3:
+                st.warning(f"⚠ Earnings in {ed} day(s) — fresh entries are deferred until after the print.")
+            else:
+                st.caption(f"Next earnings in {ed} day(s).")
+        tiers = rec.get("tiers") or {}
+        if tiers:
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            tc1.metric("T1 · Swing",   _num(tiers.get("T1"), prefix="₹"))
+            tc2.metric("T2 · Core",    _num(tiers.get("T2"), prefix="₹"))
+            tc3.metric("T3 · Stretch", _num(tiers.get("T3"), prefix="₹"))
+            tc4.metric("Risk : Reward", rr_s)
         ez = rec.get("entry_zone", (None, None))
         e1, e2, e3 = st.columns(3)
         e1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
@@ -3043,6 +3623,30 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
                 tdf.style.format({"Target ₹": "₹{:.2f}", "Upside %": "{:+.1f}%"}, na_rep="—"),
                 use_container_width=True, hide_index=True,
             )
+
+        st.markdown("**Position sizing** — risk-based share count from the stop distance")
+        ps1, ps2 = st.columns(2)
+        capital  = ps1.number_input("Capital ₹", min_value=10_000, value=500_000,
+                                    step=50_000, key=f"cap_{ticker}")
+        risk_pct = ps2.number_input("Risk per trade %", min_value=0.25, max_value=5.0,
+                                    value=1.0, step=0.25, key=f"riskpct_{ticker}")
+        stop_v = rec.get("stop_loss")
+        px     = tech_row.get("Price ₹")
+        if px and stop_v and np.isfinite(px) and np.isfinite(stop_v) and px > stop_v:
+            risk_per_share = px - stop_v
+            qty = int((capital * risk_pct / 100) // risk_per_share)
+            qty = min(qty, int(capital // px))   # never deploy more than the capital
+            if qty > 0:
+                deploy = qty * px
+                pz1, pz2, pz3, pz4 = st.columns(4)
+                pz1.metric("Shares",         f"{qty:,}")
+                pz2.metric("Deploy ₹",       f"{deploy:,.0f}")
+                pz3.metric("% of capital",   f"{deploy / capital * 100:.1f}%")
+                pz4.metric("Loss at stop ₹", f"{qty * risk_per_share:,.0f}")
+            else:
+                st.caption("Risk budget too small for one share at this stop distance.")
+        else:
+            st.caption("Position sizing unavailable — needs a valid price and stop loss.")
 
         if st.button("Generate AI thesis for this stock", key=f"ai_thesis_{ticker}"):
             sys = "NSE equity analyst. 4 sentences max. Cite numbers and macro context."
@@ -3070,6 +3674,91 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
                 st.markdown(f'<div class="intel-wrap">{thesis}</div>', unsafe_allow_html=True)
             else:
                 st.warning("Thesis unavailable (AI call failed). Check Debug Log.")
+
+# =============================
+# PORTFOLIO SECTION — rendered both as a results tab and on the empty state,
+# so position-level hold/trim/exit calls never require a fresh market scan.
+# =============================
+
+def render_portfolio_section(regime_label: str | None = None) -> None:
+    st.markdown('<div class="section-header">My Portfolio · Hold / Add / Trim / Exit</div>', unsafe_allow_html=True)
+    st.caption("Add your actual holdings; every evaluation runs the same trend-gated engine as "
+               "Deep Dive against the latest prices — no market scan required.")
+
+    registry = get_nse_registry()
+    symbols  = (sorted(registry["SYMBOL"].astype(str).unique())
+                if registry is not None and not registry.empty else [])
+    with st.form("add_position_form", clear_on_submit=True):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        if symbols:
+            sel = c1.selectbox("Ticker", symbols, index=None, placeholder="e.g. TCS")
+        else:
+            sel = c1.text_input("Ticker (NSE symbol)")
+        bp = c2.number_input("Avg buy price ₹", min_value=0.0, value=0.0, step=1.0)
+        q  = c3.number_input("Quantity", min_value=0.0, value=0.0, step=1.0)
+        bd = c4.date_input("Buy date", value=now_ist().date())
+        if st.form_submit_button("Add / Update position"):
+            if sel and bp > 0 and q > 0:
+                upsert_position(str(sel), bp, q, bd.isoformat())
+                st.success(f"Saved {str(sel).upper()}")
+            else:
+                st.warning("Need a ticker, a buy price > 0, and a quantity > 0.")
+
+    pos = load_positions()
+    if pos.empty:
+        st.info("No positions saved yet — add your holdings above to get hold/trim/exit calls "
+                "on them at any time, even without running a scan.")
+        return
+
+    dc1, dc2 = st.columns([3, 1])
+    del_sel = dc1.multiselect("Remove positions", pos["ticker"].tolist())
+    if dc2.button("Delete selected") and del_sel:
+        delete_positions(del_sel)
+        st.rerun()
+
+    if st.button(f"⚡ Evaluate {len(pos)} position(s) now"):
+        with st.spinner("Evaluating positions with current prices + fundamentals …"):
+            st.session_state["portfolio_eval"] = evaluate_positions(pos, regime_label)
+            st.session_state["portfolio_eval_at"] = fmt_ist()
+
+    ev = st.session_state.get("portfolio_eval")
+    if ev is not None and not ev.empty:
+        st.caption(f"Evaluated {st.session_state.get('portfolio_eval_at', '—')}")
+        priced = ev.dropna(subset=["Buy ₹", "Now ₹"]) if {"Buy ₹", "Now ₹"}.issubset(ev.columns) else pd.DataFrame()
+        if not priced.empty:
+            invested = float((priced["Buy ₹"] * priced["Qty"]).sum())
+            current  = float((priced["Now ₹"] * priced["Qty"]).sum())
+            pm1, pm2, pm3 = st.columns(3)
+            pm1.metric("Invested ₹", f"{invested:,.0f}")
+            pm2.metric("Current ₹",  f"{current:,.0f}",
+                       f"{(current / invested - 1) * 100:+.1f}%" if invested > 0 else None)
+            pm3.metric("Need attention", f"{int((ev['Status'] != 'OK').sum())}")
+
+        def color_pos_action(val):
+            colors = {"STRONG_BUY":"#00c896","BUY":"#00c896","ACCUMULATE":"#d4a843",
+                      "HOLD":"#8896b3","REDUCE":"#f59e0b","SELL":"#f87171","AVOID":"#f87171"}
+            c = colors.get(val, "")
+            return f"color:{c};font-weight:700" if c else ""
+        def color_pos_status(val):
+            if val in ("BELOW STOP",): return "color:#f87171;font-weight:700"
+            if val in ("ACTION NEEDED", "NO DATA"): return "color:#f59e0b;font-weight:700"
+            return "color:#00c896"
+        def color_pos_pnl(val):
+            try: v = float(val)
+            except Exception: return ""
+            return "color:#00c896;font-weight:700" if v > 0 else ("color:#f87171;font-weight:700" if v < 0 else "")
+
+        styler = ev.style.format({
+            "Qty": "{:,.0f}", "Buy ₹": "₹{:.2f}", "Now ₹": "₹{:.2f}",
+            "P&L %": "{:+.2f}%", "P&L ₹": "₹{:+,.0f}", "Conviction": "{:.0f}",
+            "Stop ₹": "₹{:.2f}", "T2 ₹": "₹{:.2f}", "Earnings (d)": "{:.0f}",
+        }, na_rep="—")
+        if "Action" in ev.columns: styler = styler.map(color_pos_action, subset=["Action"])
+        if "Status" in ev.columns: styler = styler.map(color_pos_status, subset=["Status"])
+        if "P&L %"  in ev.columns: styler = styler.map(color_pos_pnl,    subset=["P&L %"])
+        st.dataframe(styler, use_container_width=True, hide_index=True)
+        st.caption("BELOW STOP = price under the current structure stop. "
+                   "'If Holding' is the call for the position; 'Action' is the call for new money.")
 
 # =============================
 # DISPLAY RESULTS
@@ -3124,9 +3813,9 @@ if "strategy" in st.session_state:
             unsafe_allow_html=True,
         )
 
-    tab_scan, tab_early, tab_deep, tab_search, tab_sector, tab_intel, tab_dl = st.tabs([
-        "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock",
-        "Sector Leadership", "Intel & Strategy", "Downloads",
+    tab_scan, tab_early, tab_deep, tab_search, tab_port, tab_sector, tab_track, tab_intel, tab_dl = st.tabs([
+        "Momentum Scan", "Early Rally", "Deep Dive", "Search Stock", "Portfolio",
+        "Sector Leadership", "Tracker & Validation", "Intel & Strategy", "Downloads",
     ])
 
     # =======================================================
@@ -3170,8 +3859,8 @@ if "strategy" in st.session_state:
                 return "color:#f87171;font-weight:700" if val and val > RSI_OVERBOUGHT else ""
 
             display_cols = [c for c in [
-                "Ticker","Price ₹","Grade","Stage","Score","RS Rank","Pattern","Pattern Q",
-                "Signal","RSI","Vol Ratio","ADX","MACD Hist","RS vs Nifty","ROC20 %",
+                "Ticker","Price ₹","Grade","Stage","Score","RS Rank","Weekly Up","Pattern","Pattern Q",
+                "Signal","RSI","Vol Ratio","Turnover ₹Cr","ADX","MACD Hist","RS vs Nifty","ROC20 %",
                 "MA50","MA200","Dist MA50 %","Dist MA200 %","Target ₹","Upside %",
                 "52W High ₹","Gap to 52W %","New 52W High",
             ] if c in momentum_df.columns]
@@ -3182,7 +3871,7 @@ if "strategy" in st.session_state:
                 "Upside %":"+{:.1f}%","Gap to 52W %":"{:.1f}%","ADX":"{:.1f}",
                 "MACD Hist":"{:.3f}","RS vs Nifty":"{:.2f}","ROC20 %":"{:+.1f}%",
                 "Dist MA50 %":"{:+.1f}%","Dist MA200 %":"{:+.1f}%","Score":"{:.1f}",
-                "RS Rank":"{:.0f}","Pattern Q":"{:.0f}",
+                "RS Rank":"{:.0f}","Pattern Q":"{:.0f}","Turnover ₹Cr":"{:.1f}",
             }
             fmt = {k: v for k, v in fmt.items() if k in display_cols}
 
@@ -3313,11 +4002,10 @@ if "strategy" in st.session_state:
                     st.warning(f"No usable price data for {picked_symbol}. The symbol may be delisted, suspended, or too thinly traded.")
                 else:
                     try:
-                        rec = recommend_action(metrics, tech_row)
+                        rec = recommend_action(metrics, tech_row,
+                                               (regime or {}).get("label", "SELECTIVE"))
                     except Exception as e:
-                        rec = {"action": "HOLD", "conviction": 0, "scores": {},
-                               "bull_case": [f"Recommender error: {e}"], "bear_case": [],
-                               "entry_zone": (None, None), "stop_loss": None, "targets": {}}
+                        rec = _recommend_action_safe_stub(str(e))
                     in_shortlist = (shortlist_df is not None and not shortlist_df.empty
                                     and picked_symbol in set(shortlist_df["Ticker"].astype(str)))
                     ctx_label = "Ad-hoc lookup · in shortlist" if in_shortlist else "Ad-hoc lookup · not in shortlist"
@@ -3329,7 +4017,13 @@ if "strategy" in st.session_state:
                 st.info("Select a stock from the dropdown above to see its full deep dive.")
 
     # =======================================================
-    # TAB 4 — SECTOR HEATMAP
+    # TAB 5 — PORTFOLIO
+    # =======================================================
+    with tab_port:
+        render_portfolio_section((regime or {}).get("label"))
+
+    # =======================================================
+    # TAB — SECTOR HEATMAP
     # =======================================================
     with tab_sector:
         st.markdown('<div class="section-header">Sector Leadership · NSE Sector Indices</div>', unsafe_allow_html=True)
@@ -3385,7 +4079,80 @@ if "strategy" in st.session_state:
             )
 
     # =======================================================
-    # TAB 5 — INTEL & STRATEGY
+    # TAB 6 — TRACKER & VALIDATION
+    # =======================================================
+    with tab_track:
+        st.markdown('<div class="section-header">Signal Tracker · Scan History</div>', unsafe_allow_html=True)
+        scans_h, sigs_h = load_scan_history()
+        if scans_h.empty:
+            st.info("No history yet — every completed scan is saved automatically from now on. "
+                    "Run scans on different days to unlock signal aging, action-change tracking, "
+                    "and forward-return validation.")
+        else:
+            hk1, hk2, hk3 = st.columns(3)
+            hk1.metric("Scans stored",   f"{len(scans_h)}")
+            hk2.metric("Signal rows",    f"{len(sigs_h):,}")
+            hk3.metric("History window", f"{scans_h['ts_ist'].min()[:10]} → {scans_h['ts_ist'].max()[:10]}")
+            tracker = build_signal_tracker(scans_h, sigs_h)
+            if not tracker.empty:
+                if "Δ vs Prev Scan" in tracker.columns:
+                    changed = tracker[~tracker["Δ vs Prev Scan"].isin(["UNCHANGED", "STALE"])]
+                    if not changed.empty:
+                        st.markdown("**Changes vs previous scan** (new signals, drops, action flips)")
+                        st.dataframe(changed.head(40), use_container_width=True, hide_index=True)
+                st.markdown("**All tracked signals** (window: 180 days)")
+                st.dataframe(
+                    tracker.style.format({"Score": "{:.1f}"}, na_rep="—"),
+                    use_container_width=True, height=380, hide_index=True,
+                )
+        st.caption(f"History DB: {HIST_DB} — on Streamlit Cloud this survives reruns but not app "
+                   f"reboots. Set NSE_HISTORY_DIR to persistent storage for durable history.")
+
+        st.markdown('<div class="section-header" style="margin-top:30px">Live Shortlist Check</div>', unsafe_allow_html=True)
+        st.caption("Fast price-only refresh of the current shortlist vs its stops and targets — no rescan needed.")
+        if shortlist_df is None or shortlist_df.empty:
+            st.info("Run a scan first to get a shortlist to monitor.")
+        elif st.button("↻ Check shortlist vs stops & targets now"):
+            with st.spinner("Fetching latest prices …"):
+                live_df = live_shortlist_check(shortlist_df, fund_map)
+            if live_df.empty:
+                st.warning("Could not fetch live prices — try again in a moment.")
+            else:
+                def color_live_status(val):
+                    return ("color:#f87171;font-weight:700" if val == "STOP HIT"
+                            else "color:#00c896;font-weight:700" if val in ("T1 HIT", "T2 HIT") else "")
+                st.dataframe(
+                    live_df.style.map(color_live_status, subset=["Status"]).format({
+                        "Scan ₹": "₹{:.2f}", "Now ₹": "₹{:.2f}", "Δ %": "{:+.2f}%",
+                        "Stop ₹": "₹{:.2f}", "T1 ₹": "₹{:.2f}", "T2 ₹": "₹{:.2f}",
+                        "To Stop %": "{:+.1f}%", "To T2 %": "{:+.1f}%",
+                    }, na_rep="—"),
+                    use_container_width=True, hide_index=True,
+                )
+
+        st.markdown('<div class="section-header" style="margin-top:30px">Forward-Return Validation</div>', unsafe_allow_html=True)
+        st.caption("Measures what actually happened after past signals: average forward returns, "
+                   "win rates, T1-hit and stop-hit rates — grouped by action, stage, and grade. "
+                   "This is the evidence behind the conviction thresholds.")
+        if st.button("Run validation (fetches price history for stored signals)"):
+            with st.spinner("Scoring stored signals against actual forward returns …"):
+                st.session_state["validation_report"] = run_validation_report()
+        vrep = st.session_state.get("validation_report")
+        if vrep:
+            if vrep.get("error"):
+                st.warning(vrep["error"])
+            else:
+                st.caption(f"{vrep['n_signals']:,} signals across {vrep['n_scans']} scans "
+                           f"(only scans ≥3 days old are scored).")
+                st.markdown("**By recommendation action**")
+                st.dataframe(vrep["by_action"], use_container_width=True, hide_index=True)
+                st.markdown("**By rally stage**")
+                st.dataframe(vrep["by_stage"], use_container_width=True, hide_index=True)
+                st.markdown("**By conviction grade**")
+                st.dataframe(vrep["by_grade"], use_container_width=True, hide_index=True)
+
+    # =======================================================
+    # TAB 7 — INTEL & STRATEGY
     # =======================================================
     with tab_intel:
         col_l, col_r = st.columns([3, 2])
@@ -3484,3 +4251,7 @@ else:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Portfolio works without a scan — holders get hold/trim/exit calls anytime.
+    st.markdown("<hr>", unsafe_allow_html=True)
+    render_portfolio_section(None)
