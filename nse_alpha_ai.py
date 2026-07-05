@@ -1671,6 +1671,8 @@ def scan_market(symbols: list, progress_cb=None, nifty_close: pd.Series | None =
                     "Turnover ₹Cr" : round(turnover_cr, 2),
                     "Pattern"      : pat.get("name"),
                     "Pattern Q"    : pat.get("quality"),
+                    "20D High ₹"   : round(high20, 2) if np.isfinite(high20) else np.nan,
+                    "Pattern Pivot ₹": (pat.get("key_levels") or {}).get("pivot"),
                     "New 52W High" : bool(upside.get("high52_gap_pct") is not None
                                           and abs(upside["high52_gap_pct"]) < 0.5),
                 })
@@ -1806,6 +1808,8 @@ def compute_single_stock_technicals(symbol_yf: str, _nifty_hash: int = 0) -> dic
     pat = detect_base_pattern(close, df["Volume"]) or {}
     row["Pattern"]      = pat.get("name")
     row["Pattern Q"]    = pat.get("quality")
+    row["20D High ₹"]   = round(high20, 2) if np.isfinite(high20) else np.nan
+    row["Pattern Pivot ₹"] = (pat.get("key_levels") or {}).get("pivot")
     row["New 52W High"] = bool(upside.get("high52_gap_pct") is not None
                                and abs(upside["high52_gap_pct"]) < 0.5)
     row["Weekly Up"]    = weekly_uptrend(close)
@@ -1908,25 +1912,38 @@ def attach_grade(df: pd.DataFrame, regime_label: str = "SELECTIVE",
         + 0.10 * pat_n + 0.10 * reg_n + 0.10 * stg_n
     )
     d["GradeScore"] = grade_score.round(1)
+    # Cutoffs rebased to the ACHIEVABLE range of the weighted formula.
+    # With realistic caps (Score~72, RS 99, in-play sector, PatQ~87,
+    # SELECTIVE regime, Stage 2) the score peaks around 0.80-0.84 — the old
+    # A+>=85 gate was mathematically unreachable and the July-5 live run
+    # produced ZERO A/A+ grades across 392 stocks. New cutoffs give the top
+    # confluence names A/A+ without inflating the middle of the pack.
     def _g(s):
-        if s >= 85: return "A+"
-        if s >= 75: return "A"
-        if s >= 65: return "B+"
-        if s >= 50: return "B"
+        if s >= 76: return "A+"
+        if s >= 68: return "A"
+        if s >= 60: return "B+"
+        if s >= 48: return "B"
         return "C"
     d["Grade"] = d["GradeScore"].apply(_g)
     return d
 
 
 def build_shortlist(df: pd.DataFrame) -> pd.DataFrame:
-    """Top N rows above score threshold, with a floor."""
+    """Top N rows above score threshold, with a floor. UNTRADEABLE names
+    (avg daily turnover < ₹1 Cr) are excluded up-front — they'd only occupy
+    deep-dive slots on stocks the multibagger gate tells the user to CUT."""
     if df.empty or "Score" not in df.columns:
         return df.head(0)
-    above = df[df["Score"] >= SHORTLIST_MIN_SCORE].sort_values("Score", ascending=False)
+    pool = df
+    if "Turnover ₹Cr" in df.columns:
+        liquid = df[df["Turnover ₹Cr"].fillna(0) >= 1.0]
+        if not liquid.empty:
+            pool = liquid
+    above = pool[pool["Score"] >= SHORTLIST_MIN_SCORE].sort_values("Score", ascending=False)
     if len(above) >= SHORTLIST_FLOOR:
         return above.head(SHORTLIST_TARGET).reset_index(drop=True)
-    # Fall back: take top SHORTLIST_FLOOR overall
-    return df.sort_values("Score", ascending=False).head(SHORTLIST_FLOOR).reset_index(drop=True)
+    # Fall back: take top SHORTLIST_FLOOR overall (from the liquid pool)
+    return pool.sort_values("Score", ascending=False).head(SHORTLIST_FLOOR).reset_index(drop=True)
 
 # =============================
 # FUNDAMENTALS LAYER (free, yfinance-only — FMP-equivalent)
@@ -2042,6 +2059,30 @@ def compute_dcf(info: dict, cashflow: pd.DataFrame, balance: pd.DataFrame) -> di
         "confidence": confidence,
     })
     return out
+
+def dcf_reliability(dcf: dict | None) -> tuple[bool, str]:
+    """Sanity gate on DCF output. External reviews flagged extreme values
+    (INDOFARM −109%, SGMART −82.7%) as credibility-killers — a simple 5-yr
+    FCF model is unreliable for names with short history, negative FCF, or
+    hyper-growth. Returns (is_reliable, note). Unreliable DCFs are excluded
+    from scoring/targets and displayed with the note instead of the number."""
+    if not dcf or dcf.get("intrinsic_per_share") is None:
+        return False, "DCF unavailable — no usable FCF history"
+    up = dcf.get("upside_pct")
+    if dcf.get("confidence") == "low":
+        return False, "DCF low-confidence — short FCF history or negative FCF; excluded from scoring"
+    if up is not None and abs(up) > 60:
+        return False, f"DCF extreme ({up:+.0f}%) — model assumptions unreliable for this name; excluded from scoring"
+    return True, ""
+
+def growth_flag(m: dict) -> str | None:
+    """Footnote for anomalous growth figures (SGMART 1,494% rev CAGR etc.):
+    distinguish genuine hyper-growth from tiny-base / M&A artifacts."""
+    rg = m.get("rev_cagr_3y")
+    eg = m.get("earnings_growth")
+    if (rg is not None and rg > 1.0) or (eg is not None and eg > 2.0):
+        return "⚠ extreme growth — verify base effect (tiny prior-year base or M&A)"
+    return None
 
 def _parse_next_earnings(cal) -> str | None:
     """Extract the next upcoming earnings date (ISO yyyy-mm-dd) from yfinance
@@ -2300,12 +2341,25 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
     # Component scores 0–100
     tech_score = float(_coalesce(tech.get("Score"), 0))
 
-    qty_inputs = [
-        (metrics.get("roe"),           lambda v: 1.0 if v and v > 0.18 else (0.6 if v and v > 0.12 else 0.2)),
-        (metrics.get("op_margin"),     lambda v: 1.0 if v and v > 0.15 else (0.6 if v and v > 0.08 else 0.2)),
-        (metrics.get("debt_to_equity"),lambda v: 0.2 if v and v > 1.5 else (0.6 if v and v > 0.7 else 1.0)),
-        (metrics.get("interest_coverage"), lambda v: 1.0 if v and v > 6 else (0.5 if v and v > 3 else 0.1)),
-    ]
+    # Bank-aware quality: for lenders, D/E and EBIT/interest-coverage are
+    # structurally meaningless (banks are levered by design and yfinance
+    # doesn't emit meaningful EBIT for them) — weight ROE/ROA instead.
+    _sector = SECTOR_MAP.get(str(tech.get("Ticker", "")))
+    is_lender = _sector in ("Banking", "Finance") or (
+        str(metrics.get("sector") or "").lower() == "financial services"
+    )
+    if is_lender:
+        qty_inputs = [
+            (metrics.get("roe"), lambda v: 1.0 if v and v > 0.15 else (0.6 if v and v > 0.10 else 0.2)),
+            (metrics.get("roa"), lambda v: 1.0 if v and v > 0.015 else (0.6 if v and v > 0.008 else 0.2)),
+        ]
+    else:
+        qty_inputs = [
+            (metrics.get("roe"),           lambda v: 1.0 if v and v > 0.18 else (0.6 if v and v > 0.12 else 0.2)),
+            (metrics.get("op_margin"),     lambda v: 1.0 if v and v > 0.15 else (0.6 if v and v > 0.08 else 0.2)),
+            (metrics.get("debt_to_equity"),lambda v: 0.2 if v and v > 1.5 else (0.6 if v and v > 0.7 else 1.0)),
+            (metrics.get("interest_coverage"), lambda v: 1.0 if v and v > 6 else (0.5 if v and v > 3 else 0.1)),
+        ]
     qparts = [f(v) for v, f in qty_inputs if v is not None]
     quality_score = 100 * (sum(qparts) / len(qparts)) if qparts else 50.0
 
@@ -2316,7 +2370,10 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
     peg = metrics.get("peg")
     if peg and peg > 0:
         val_inputs.append(1.0 if peg < 1 else (0.6 if peg < 2 else 0.2))
-    dcf_up = (metrics.get("dcf") or {}).get("upside_pct")
+    # DCF only counts toward the value score when it passes the sanity gate
+    # (extreme/low-confidence DCFs were poisoning value scores per review).
+    _dcf_ok, _ = dcf_reliability(metrics.get("dcf"))
+    dcf_up = (metrics.get("dcf") or {}).get("upside_pct") if _dcf_ok else None
     if dcf_up is not None:
         val_inputs.append(1.0 if dcf_up > 20 else (0.6 if dcf_up > 0 else 0.2))
     value_score = 100 * (sum(val_inputs) / len(val_inputs)) if val_inputs else 50.0
@@ -2490,7 +2547,8 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
     # estimate_upside, not pure Fibonacci).
     _add_target("technical",    tech.get("Target ₹"))
     _add_target("analyst_mean", metrics.get("target_mean"))
-    _add_target("dcf",          (metrics.get("dcf") or {}).get("intrinsic_per_share"))
+    if _dcf_ok:   # unreliable DCFs stay out of the target stack too
+        _add_target("dcf", (metrics.get("dcf") or {}).get("intrinsic_per_share"))
 
     # Tiered plan: T1 = ~1.5 ATR swing target, T2 = nearest structural target
     # above T1, T3 = most ambitious validated target. Kept monotonic so the
@@ -2505,7 +2563,9 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
         t1 = min(t1, t2 * 0.99)
         tiers = {"T1": round(t1, 2), "T2": round(t2, 2), "T3": round(t3, 2)}
         if stop is not None and price_v > stop:
-            risk_reward = round((t2 - price_v) / (price_v - stop), 2)
+            # Clamp at 10 — values above that are tiny-stop-distance
+            # artifacts, not real edges (review flagged an 11.39 outlier).
+            risk_reward = min(round((t2 - price_v) / (price_v - stop), 2), 10.0)
 
     # Reliability gate: a fresh BUY must clear ~1.8× reward-to-risk, otherwise
     # it is only worth scaling into.
@@ -2635,12 +2695,14 @@ def _multibagger_reasons(m: dict, tech: dict, sector_in_top5: bool, sector_name:
     pat  = tech.get("Pattern")
     patq = _safe_float(tech.get("Pattern Q"), None)
     if pat and patq and patq >= 50:
-        out.append(f"{pat} base detected (quality {int(patq)}/100)")
+        out.append(f"{pat} detected (quality {int(patq)}/100)")
 
     obv  = _safe_float(tech.get("OBV Slope"), None)
     volr = _safe_float(tech.get("Vol Ratio"), None)
     if obv is not None and obv > 0 and volr is not None and volr >= 2.0:
-        out.append(f"Volume drying up on dips, {volr:.1f}× on last green day — OBV inflection")
+        # Honest phrasing: we know OBV is rising and the last bar spiked;
+        # we do NOT verify that down-day volume contracted, so don't claim it.
+        out.append(f"OBV rising; {volr:.1f}× volume on last green day — accumulation signature")
 
     pe   = _safe_float(m.get("pe_forward"), None) or _safe_float(m.get("pe_trailing"), None)
     roce = _safe_float(m.get("roce"), None)
@@ -2673,10 +2735,14 @@ def _multibagger_safe_stub(reason: str = "unknown error") -> dict:
 
 def compute_multibagger_signal(tech: dict, metrics: dict,
                                 sector_top5: set | None = None,
-                                shortlist_size: int = 25) -> dict:
+                                shortlist_size: int = 25,
+                                rec_action: str | None = None) -> dict:
     """Rule-based DEPLOY_NOW / STARTER / SET_ALERTS / CUT classifier.
-    Reuses tech['Turnover ₹Cr'] added by PR #8 for the liquidity gate.
-    Returns a dict wired directly into fund_map[sym]['multibagger'].
+    Buckets are driven by the CONTINUOUS GradeScore + specific conditions,
+    NOT letter grades — the July-5 live run produced zero A/A+ across 392
+    stocks, so letter-grade gates collapsed every name into Set Alerts.
+    `rec_action` (from recommend_action) enables the coherence rule: a
+    STRONG_BUY/BUY with OK liquidity can never land below STARTER.
     """
     m = metrics or {}
     tech = tech or {}
@@ -2685,7 +2751,12 @@ def compute_multibagger_signal(tech: dict, metrics: dict,
     stage_id = int(_safe_float(tech.get("StageId"), 0) or 0)
     grade   = tech.get("Grade", "C")
     score   = _safe_float(tech.get("Score"), 0) or 0
-    rs_rank = _safe_float(tech.get("RS Rank"), 0) or 0
+    # GradeScore exists on scan rows; ad-hoc Search Stock rows lack it —
+    # fall back to a slightly discounted composite Score.
+    grade_score = _safe_float(tech.get("GradeScore"), None)
+    if grade_score is None:
+        grade_score = score * 0.9
+    rs_rank = _safe_float(tech.get("RS Rank"), 50) or 50   # neutral when absent
     pat_q   = _safe_float(tech.get("Pattern Q"), 0) or 0
     rsi     = _safe_float(tech.get("RSI"), 50) or 50
     vol_r   = _safe_float(tech.get("Vol Ratio"), 1.0) or 1.0
@@ -2699,10 +2770,25 @@ def compute_multibagger_signal(tech: dict, metrics: dict,
 
     liq_verdict = _liquidity_verdict(turn_cr)
 
+    # Nearest actionable pivot ABOVE price: pattern pivot > 20D high > 52W
+    # high, each only if within +12% of price. Never emit a far-away trigger
+    # (the July-5 run told the user to "reclaim" levels 30-66% above price).
+    high52  = _safe_float(tech.get("52W High ₹"), None)
+    high20  = _safe_float(tech.get("20D High ₹"), None)
+    pat_piv = _safe_float(tech.get("Pattern Pivot ₹"), None)
+    pivot_ref = None
+    if price and math.isfinite(price):
+        cands = [p for p in (pat_piv, high20, high52)
+                 if p and math.isfinite(p) and price < p <= price * 1.12]
+        pivot_ref = min(cands) if cands else round(price * 1.05, 2)
+
     # ── Bucket decision ─────────────────────────────────────────────
     is_breakout   = signal == "Breakout"
     reasons = _multibagger_reasons(m, tech, sector_in_top5, sector_disp)
     caveats: list = []
+
+    near_pivot = bool(price and pivot_ref and
+                      (price >= pivot_ref * 0.97))   # within 3% below, or through it
 
     if liq_verdict == "UNTRADEABLE":
         bucket = "CUT"
@@ -2716,15 +2802,16 @@ def compute_multibagger_signal(tech: dict, metrics: dict,
         bucket = "CUT"
         bucket_label = "Cut — Weak setup"
         reasons = [f"Composite Score {score:.0f} with no confirmed base"] + reasons[:2]
-    elif (liq_verdict == "OK" and stage_id in (2, 3) and grade in ("A+", "A")
-          and rs_rank >= 80
-          and (pat_q >= 65 or (is_breakout and vol_r > 1.8))):
+    elif (liq_verdict == "OK" and stage_id in (2, 3)
+          and rs_rank >= 70 and grade_score >= 60
+          and (pat_q >= 65 or (is_breakout and vol_r >= 1.8))
+          and near_pivot):
         bucket = "DEPLOY_NOW"
         bucket_label = "Deploy Now"
         if not reasons:
-            reasons = [f"Grade {grade}, RS Rank {int(rs_rank)}, Stage {stage_id}"]
+            reasons = [f"GradeScore {grade_score:.0f}, RS Rank {int(rs_rank)}, Stage {stage_id}"]
     elif (liq_verdict in ("OK", "THIN") and stage_id in (1, 2)
-          and 40 <= rsi <= 55 and pat_q >= 50 and grade in ("A+", "A", "B+")):
+          and 40 <= rsi <= 58 and pat_q >= 55 and grade_score >= 55):
         bucket = "STARTER"
         bucket_label = "Starter Tranche"
         if liq_verdict == "THIN":
@@ -2732,6 +2819,15 @@ def compute_multibagger_signal(tech: dict, metrics: dict,
     else:
         bucket = "SET_ALERTS"
         bucket_label = "Set Alerts"
+
+    # Coherence rule: the recommendation engine and the multibagger engine
+    # must agree directionally. A STRONG_BUY/BUY with OK liquidity is at
+    # minimum a starter tranche — never "wait on the sidelines".
+    if (bucket == "SET_ALERTS" and rec_action in ("STRONG_BUY", "BUY")
+            and liq_verdict == "OK"):
+        bucket = "STARTER"
+        bucket_label = "Starter Tranche"
+        reasons = [f"Recommendation engine rates this {rec_action.replace('_', ' ')} — starter position warranted"] + reasons[:3]
 
     # ── Action strip (entry / stop / targets / tranche) ─────────────
     entry_low, entry_high = None, None
@@ -2741,43 +2837,41 @@ def compute_multibagger_signal(tech: dict, metrics: dict,
     add_trigger = ""
     alert_trigger = None
 
-    if price and math.isfinite(price):
-        # ATR-based stop (2×ATR%), entry zone below current price.
-        stop = round(price * (1 - 2 * atr_pct / 100), 2)
-        entry_low  = round(price * (1 - 0.5 * atr_pct / 100), 2)
-        entry_high = round(price, 2)
-
-        # Reuse recommend_action-style tiered targets when available.
-        target_1 = _safe_float(tech.get("Target ₹"), None)
-        high52   = _safe_float(tech.get("52W High ₹"), None)
-        if high52 and high52 > price:
-            target_2 = round(high52, 2)
-        elif target_1:
+    if price and math.isfinite(price) and bucket != "CUT":
+        # Monotonic targets: T1 < T2 always, no duplicates.
+        tech_target = _safe_float(tech.get("Target ₹"), None)
+        t_cands = sorted({round(t, 2) for t in (tech_target, high52)
+                          if t and math.isfinite(t) and t > price * 1.01})
+        if t_cands:
+            target_1 = t_cands[0]
+            if len(t_cands) > 1 and t_cands[1] > target_1 * 1.005:
+                target_2 = t_cands[1]
+            else:
+                target_2 = round(max(price * 1.30, target_1 * 1.05), 2)
+        else:
+            target_1 = round(price * 1.12, 2)
             target_2 = round(price * 1.30, 2)
 
-        if bucket == "DEPLOY_NOW":
-            tranche = "FULL"
-            add_trigger = "add on strong close above pivot"
-        elif bucket == "STARTER":
-            tranche = "STARTER"
-            add_trigger = f"add above ₹{round(price * 1.06, 2)} on volume"
-        elif bucket == "SET_ALERTS":
+        if bucket in ("DEPLOY_NOW", "STARTER"):
+            # Buy-now zone: entry just under price, ATR-based stop.
+            stop = round(price * (1 - 2 * atr_pct / 100), 2)
+            entry_low  = round(price * (1 - 0.5 * atr_pct / 100), 2)
+            entry_high = round(price, 2)
+            if bucket == "DEPLOY_NOW":
+                tranche = "FULL"
+                add_trigger = (f"add on strong close above ₹{pivot_ref}" if pivot_ref
+                               else "add on strong close above pivot")
+            else:
+                tranche = "STARTER"
+                add_trigger = f"add above ₹{round(price * 1.06, 2)} on volume"
+        else:  # SET_ALERTS — entry only on reclaim of the near pivot.
             tranche = "NONE"
-            # Alert trigger = 20-day pivot from breakout lookback, else pattern pivot.
-            piv = None
-            try:
-                piv = _safe_float(tech.get("52W High ₹"), None)
-                # Prefer nearer pivot if pattern gave one.
-                if isinstance(tech.get("Pattern"), str):
-                    # Pattern key_levels aren't in tech row, so approx as 5% above price
-                    piv = round(price * 1.05, 2)
-            except Exception:
-                pass
-            alert_trigger = f"reclaim ₹{piv or round(price * 1.05, 2)} on volume"
-        else:  # CUT
-            tranche = "NONE"
+            alert_trigger = f"reclaim ₹{pivot_ref} on volume"
+            entry_low  = round(pivot_ref, 2)
+            entry_high = round(pivot_ref * 1.02, 2)
+            stop = round(pivot_ref * (1 - 1.5 * atr_pct / 100), 2)
+            caveats.append("Levels are reclaim-based — do not buy before the trigger fires")
 
-    # Post-IPO caveat if listing is young — approx via mcap + missing history flags
     if not reasons:
         reasons = [f"Grade {grade}, Score {score:.0f}, Stage {stage_id}"]
 
@@ -3170,7 +3264,25 @@ def evaluate_positions(pos_df: pd.DataFrame, regime_label: str | None = None) ->
 # EXCEL EXPORT
 # =============================
 
-def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
+def _r2(v, nd: int = 2):
+    """Round for export — kills float dust like 76.40000000000001. Returns
+    None untouched; non-numerics untouched."""
+    try:
+        f = float(v)
+        return round(f, nd) if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return v
+
+def _rr_display(rr):
+    """Clamp Risk:Reward for display — values above 10 are stop-distance
+    artifacts, not real edges."""
+    r = _safe_float(rr, None)
+    if r is None:
+        return None
+    return min(round(r, 2), 10.0)
+
+def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict,
+                     mb: dict | None = None) -> dict:
     """One flat row for the Summary sheet."""
     dcf = m.get("dcf") or {}
     return {
@@ -3178,35 +3290,81 @@ def _flatten_metrics(sym_no_suffix: str, m: dict, t: dict, rec: dict) -> dict:
         "Name": m.get("name"),
         "Sector": m.get("sector"),
         "Industry": m.get("industry"),
-        "Price ₹": t.get("Price ₹"),
+        "Price ₹": _r2(t.get("Price ₹")),
         "Stage": t.get("Stage"),
-        "Score": t.get("Score"),
+        "Grade": t.get("Grade"),
+        "Score": _r2(t.get("Score"), 1),
+        "Multibagger Bucket": (mb or {}).get("bucket_label"),
         "Action": rec.get("action"),
         "Holder Action": rec.get("holder_action"),
         "Trend": rec.get("trend"),
-        "Conviction": rec.get("conviction"),
-        "Risk:Reward": rec.get("risk_reward"),
-        "Upside % (tech)": t.get("Upside %"),
-        "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
-        "DCF Upside %": dcf.get("upside_pct"),
-        "P/E (fwd)": m.get("pe_forward"),
-        "P/B": m.get("pb"),
-        "EV/EBITDA": m.get("ev_ebitda"),
-        "ROE %": (m.get("roe") or 0) * 100 if m.get("roe") is not None else None,
-        "ROCE %": (m.get("roce") or 0) * 100 if m.get("roce") is not None else None,
-        "Op Margin %": (m.get("op_margin") or 0) * 100 if m.get("op_margin") is not None else None,
-        "D/E": m.get("debt_to_equity"),
-        "Rev CAGR 3Y %": (m.get("rev_cagr_3y") or 0) * 100 if m.get("rev_cagr_3y") is not None else None,
-        "Inst Hold %": (m.get("institutional_held") or 0) * 100 if m.get("institutional_held") is not None else None,
+        "Conviction": _r2(rec.get("conviction"), 1),
+        "Risk:Reward": _rr_display(rec.get("risk_reward")),
+        "Upside % (tech)": _r2(t.get("Upside %"), 1),
+        "DCF Intrinsic ₹": _r2(dcf.get("intrinsic_per_share")),
+        "DCF Upside %": _r2(dcf.get("upside_pct"), 1),
+        "P/E (fwd)": _r2(m.get("pe_forward")),
+        "P/B": _r2(m.get("pb")),
+        "EV/EBITDA": _r2(m.get("ev_ebitda")),
+        "ROE %": _r2((m.get("roe") or 0) * 100 if m.get("roe") is not None else None, 1),
+        "ROCE %": _r2((m.get("roce") or 0) * 100 if m.get("roce") is not None else None, 1),
+        "Op Margin %": _r2((m.get("op_margin") or 0) * 100 if m.get("op_margin") is not None else None, 1),
+        "D/E": _r2(m.get("debt_to_equity")),
+        "Rev CAGR 3Y %": _r2((m.get("rev_cagr_3y") or 0) * 100 if m.get("rev_cagr_3y") is not None else None, 1),
+        "Inst Hold %": _r2((m.get("institutional_held") or 0) * 100 if m.get("institutional_held") is not None else None, 1),
         "Analyst Rec": m.get("recommendation_key"),
         "Next Earnings": m.get("next_earnings"),
     }
+
+# Methodology documentation — written to the XLSX and mirrored in the UI so
+# the scoring is never a black box (external review: "methodology is opaque").
+METHODOLOGY_ROWS = [
+    ("Composite Score (0-100)",
+     "0.25×stage weight (S2=1.0, S1=0.85, S3=0.75, S4=0.15) + 0.10×volume ratio (÷3, capped) + "
+     "0.05×RSI health (best 50-65) + 0.10×MACD momentum + 0.10×ADX strength + 0.15×RS percentile + "
+     "0.10×sector-in-top-5 + 0.10×pattern quality + 0.05×upside (÷30, capped); × regime multiplier."),
+    ("GradeScore & letter grades",
+     "0.35×Score + 0.20×RS Rank + 0.15×sector-in-top-5 + 0.10×pattern quality + 0.10×regime "
+     "(AGGRESSIVE=1.0/SELECTIVE=0.7/DEFENSIVE=0.4) + 0.10×stage. Letters: A+ ≥76, A 68-75, B+ 60-67, B 48-59, C <48."),
+    ("Multibagger buckets",
+     "CUT: turnover <₹1 Cr/day, or Stage-4 without A-grade confluence, or Score<50 with no base. "
+     "DEPLOY NOW: liquidity OK + Stage 2/3 + RS Rank ≥70 + GradeScore ≥60 + (pattern quality ≥65 or "
+     "breakout on ≥1.8× volume) + price within 3% of pivot. STARTER: Stage 1/2 + RSI 40-58 + pattern "
+     "quality ≥55 + GradeScore ≥55. SET ALERTS: everything else. Coherence rule: a STRONG_BUY/BUY with "
+     "OK liquidity is never below STARTER."),
+    ("Multibagger Score (0-100)",
+     "30% growth (rev+EPS 3Y CAGR, capped 30%) + 25% quality (ROE+ROCE, capped 35%) + 20% market-cap "
+     "runway (peaks near ₹5,000 Cr) + 10% sector tailwind + 15% setup optionality (Stage 1/2 with base)."),
+    ("DCF assumptions",
+     "5-year FCF projection; growth = historical 3Y FCF CAGR clipped to 4-18% (fallback: earnings growth, "
+     "default 10%); discount rate 12% (India ERP); terminal growth 4%. DCF is EXCLUDED from scoring and "
+     "targets when confidence is low or |upside| > 60% — a simple FCF model is unreliable for short-history, "
+     "negative-FCF, or hyper-growth names (see 'DCF Note' column)."),
+    ("Liquidity gates",
+     "Avg daily turnover = 20-day avg volume × price. <₹1 Cr = UNTRADEABLE (auto-CUT, excluded from "
+     "shortlist); ₹1-5 Cr = THIN (starter sizing only); ≥₹5 Cr = OK."),
+    ("Alert triggers",
+     "Reclaim level = nearest pivot above price among {pattern pivot, 20-day high, 52-week high}, only "
+     "considering levels within +12% of price. Entries for 'Set Alerts' names are reclaim-based: do not "
+     "buy before the trigger fires."),
+    ("Targets & stops",
+     "Technical target = min of (52W high, 2×capped-ATR projection, capped Fibonacci extension), bounded to "
+     "+2%..+200%. T1 < T2 always. Stop = 2×ATR% below price (reclaim-based stops sit 1.5×ATR% below the "
+     "pivot). Risk:Reward capped at 10 for display."),
+    ("Growth Flag",
+     "Revenue CAGR > 100% or earnings growth > 200% is flagged '⚠ extreme growth — verify base effect' "
+     "(tiny prior-year base or M&A can produce these figures; they are capped in scoring)."),
+    ("Bank-adjusted quality",
+     "For Banking/Finance names, D/E and interest coverage are skipped (structurally meaningless for "
+     "lenders); quality scores weight ROE and ROA instead."),
+]
 
 def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund_map: dict) -> bytes:
     """
     Return XLSX bytes. Sheets:
       Full Scan, Summary, Valuation, Quality, Growth, Ownership, Recommendation,
-      and one vertical sheet per shortlisted stock (cap 25).
+      Multibagger (sorted by score), Methodology, and one vertical sheet per
+      shortlisted stock (cap 25).
     """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -3228,40 +3386,42 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
             mb = payload.get("multibagger") if payload else None
             if mb is None:
                 try:
-                    mb = compute_multibagger_signal(t_row.to_dict(), m)
+                    mb = compute_multibagger_signal(t_row.to_dict(), m, rec_action=rec.get("action"))
                 except Exception as e:
                     mb = _multibagger_safe_stub(str(e))
 
-            rows_summary.append(_flatten_metrics(ticker_no, m, t_row.to_dict(), rec))
+            rows_summary.append(_flatten_metrics(ticker_no, m, t_row.to_dict(), rec, mb=mb))
             mb_action = mb.get("action", {}) or {}
             mb_ez = mb_action.get("entry_zone", (None, None))
             mb_liq = mb.get("liquidity", {}) or {}
             rows_mb.append({
                 "Ticker": ticker_no,
                 "Bucket": mb.get("bucket_label"),
-                "Multibagger Score": mb.get("multibagger_score"),
-                "Entry Low": mb_ez[0], "Entry High": mb_ez[1],
-                "Stop": mb_action.get("stop"),
-                "Target 1": mb_action.get("target_1"),
-                "Target 2": mb_action.get("target_2"),
+                "Multibagger Score": _r2(mb.get("multibagger_score"), 0),
+                "Entry Low": _r2(mb_ez[0]), "Entry High": _r2(mb_ez[1]),
+                "Stop": _r2(mb_action.get("stop")),
+                "Target 1": _r2(mb_action.get("target_1")),
+                "Target 2": _r2(mb_action.get("target_2")),
                 "Tranche": mb_action.get("tranche_size"),
                 "Add Trigger": mb_action.get("add_trigger"),
                 "Alert Trigger": mb.get("alert_trigger"),
-                "Avg Daily Turnover ₹Cr": mb_liq.get("avg_daily_turnover_cr"),
+                "Avg Daily Turnover ₹Cr": _r2(mb_liq.get("avg_daily_turnover_cr")),
                 "Liquidity Verdict": mb_liq.get("verdict"),
                 "Reasons": " | ".join(mb.get("reasons", [])),
                 "Caveats": " | ".join(mb.get("caveats", [])),
             })
             dcf = m.get("dcf") or {}
+            _dcf_ok_x, _dcf_note_x = dcf_reliability(dcf)
             rows_val.append({
                 "Ticker": ticker_no,
-                "P/E trailing": m.get("pe_trailing"), "P/E forward": m.get("pe_forward"),
-                "P/B": m.get("pb"), "EV/EBITDA": m.get("ev_ebitda"), "PEG": m.get("peg"),
-                "P/S": m.get("price_to_sales"),
-                "DCF Intrinsic ₹": dcf.get("intrinsic_per_share"),
-                "DCF Upside %": dcf.get("upside_pct"),
+                "P/E trailing": _r2(m.get("pe_trailing")), "P/E forward": _r2(m.get("pe_forward")),
+                "P/B": _r2(m.get("pb")), "EV/EBITDA": _r2(m.get("ev_ebitda")), "PEG": _r2(m.get("peg")),
+                "P/S": _r2(m.get("price_to_sales")),
+                "DCF Intrinsic ₹": _r2(dcf.get("intrinsic_per_share")) if _dcf_ok_x else None,
+                "DCF Upside %": _r2(dcf.get("upside_pct"), 1) if _dcf_ok_x else None,
                 "DCF Confidence": dcf.get("confidence"),
-                "Dividend Yield %": (m.get("dividend_yield") or 0) * 100 if m.get("dividend_yield") is not None else None,
+                "DCF Note": _dcf_note_x or None,
+                "Dividend Yield %": _r2((m.get("dividend_yield") or 0) * 100 if m.get("dividend_yield") is not None else None, 2),
             })
             rows_q.append({
                 "Ticker": ticker_no,
@@ -3286,6 +3446,7 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 "Revenue Growth %": (m.get("revenue_growth") or 0) * 100 if m.get("revenue_growth") is not None else None,
                 "Fwd EPS Growth %": (m.get("fwd_eps_growth") or 0) * 100 if m.get("fwd_eps_growth") is not None else None,
                 "Avg Earnings Surprise %": m.get("earnings_surprise_avg"),
+                "Growth Flag": growth_flag(m),
             })
             rows_o.append({
                 "Ticker": ticker_no,
@@ -3329,7 +3490,12 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
         pd.DataFrame(rows_g).to_excel(writer,       sheet_name="Growth",         index=False)
         pd.DataFrame(rows_o).to_excel(writer,       sheet_name="Ownership",      index=False)
         pd.DataFrame(rows_rec).to_excel(writer,     sheet_name="Recommendation", index=False)
-        pd.DataFrame(rows_mb).to_excel(writer,      sheet_name="Multibagger",    index=False)
+        mb_df = pd.DataFrame(rows_mb)
+        if not mb_df.empty and "Multibagger Score" in mb_df.columns:
+            mb_df = mb_df.sort_values("Multibagger Score", ascending=False)
+        mb_df.to_excel(writer, sheet_name="Multibagger", index=False)
+        pd.DataFrame(METHODOLOGY_ROWS, columns=["Topic", "Explanation"]).to_excel(
+            writer, sheet_name="Methodology", index=False)
 
         # Per-stock vertical sheets (cap 25)
         for _, t_row in shortlist_df.head(25).iterrows():
@@ -3680,7 +3846,7 @@ def _run_pipeline(cb=None) -> dict:
             except Exception as e:
                 rec = _recommend_action_safe_stub(str(e))
             try:
-                mb = compute_multibagger_signal(tech, m, sector_top5=top5_sectors)
+                mb = compute_multibagger_signal(tech, m, sector_top5=top5_sectors, rec_action=rec.get("action"))
             except Exception as e:
                 mb = _multibagger_safe_stub(str(e))
             fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec, "multibagger": mb}
@@ -3932,13 +4098,16 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
         v5.metric("PEG",          _num(m.get("peg")))
         v6.metric("P/S",          _num(m.get("price_to_sales")))
         v7.metric("Div Yield",    _pct(m.get("dividend_yield")))
-        v8.metric("DCF Intrinsic ₹", _num(dcf.get("intrinsic_per_share")))
+        _dcf_ok_ui, _dcf_note_ui = dcf_reliability(dcf)
+        v8.metric("DCF Intrinsic ₹", _num(dcf.get("intrinsic_per_share")) if _dcf_ok_ui else "N/A")
         d1, d2, d3 = st.columns(3)
-        d1.metric("DCF Upside %", _num(dcf.get("upside_pct"), suffix="%"))
+        d1.metric("DCF Upside %", _num(dcf.get("upside_pct"), suffix="%") if _dcf_ok_ui else "N/A")
         d2.metric("DCF Confidence", dcf.get("confidence", "—"))
         a = dcf.get("assumptions", {})
         d3.metric("Growth used", _pct(a.get("growth")) if a else "—")
-        if a:
+        if not _dcf_ok_ui:
+            st.warning(_dcf_note_ui)
+        elif a:
             st.caption(
                 f"DCF: 5y FCF @ growth {_pct(a.get('growth'))} · discount {_pct(a.get('discount_rate'))} · "
                 f"terminal {_pct(a.get('terminal_growth'))} · history {a.get('fcf_history_years','—')}y"
@@ -3959,6 +4128,10 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
         q9.metric("Interest Cov", _num(m.get("interest_coverage"), suffix="×"))
         q10.metric("Current Ratio", _num(m.get("current_ratio")))
         q11.metric("Quick Ratio",   _num(m.get("quick_ratio")))
+        if (SECTOR_MAP.get(ticker) in ("Banking", "Finance")
+                or str(m.get("sector") or "").lower() == "financial services"):
+            st.caption("Bank-adjusted quality: D/E and interest coverage are structurally "
+                       "meaningless for lenders and are skipped in the quality score — ROE/ROA weighted instead.")
 
     with stab_g:
         g1, g2, g3, g4 = st.columns(4)
@@ -3970,6 +4143,9 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
         g5.metric("Revenue Growth (TTM)",  _pct(m.get("revenue_growth")))
         g6.metric("Earnings Growth (TTM)", _pct(m.get("earnings_growth")))
         g7.metric("Avg Earnings Surprise", _num(m.get("earnings_surprise_avg"), suffix="%"))
+        _gflag = growth_flag(m)
+        if _gflag:
+            st.warning(_gflag)
 
     with stab_o:
         o1, o2, o3, o4 = st.columns(4)
@@ -4354,6 +4530,46 @@ if "strategy" in st.session_state:
         if shortlist_df is None or shortlist_df.empty:
             st.info("No shortlist available. Run the scan to generate a shortlist of top-scored stocks.")
         else:
+            # ── Today's Deploy List — the answer to "what do I act on now?" ──
+            _buckets: dict = {"DEPLOY_NOW": [], "STARTER": [], "SET_ALERTS": [], "CUT": []}
+            for _, _t in shortlist_df.iterrows():
+                _mbp = (fund_map.get(f"{_t['Ticker']}.NS") or {}).get("multibagger") or {}
+                _buckets.setdefault(_mbp.get("bucket", "SET_ALERTS"), []).append((_t.to_dict(), _mbp))
+            n_dep, n_st = len(_buckets["DEPLOY_NOW"]), len(_buckets["STARTER"])
+            n_al, n_cut = len(_buckets["SET_ALERTS"]), len(_buckets["CUT"])
+            st.markdown(
+                f"<div style='font-family:JetBrains Mono,monospace;font-size:0.78rem;color:#8896b3;"
+                f"display:flex;gap:18px;flex-wrap:wrap;padding:2px 0 10px'>"
+                f"<span>🟢 Deploy <strong style='color:#00c896'>{n_dep}</strong></span>"
+                f"<span>🟡 Starter <strong style='color:#d4a843'>{n_st}</strong></span>"
+                f"<span>🔵 Alerts <strong style='color:#4f8ef7'>{n_al}</strong></span>"
+                f"<span>🔴 Cut <strong style='color:#f87171'>{n_cut}</strong></span></div>",
+                unsafe_allow_html=True,
+            )
+            deployables = _buckets["DEPLOY_NOW"] + _buckets["STARTER"]
+            if deployables:
+                st.markdown("**Today's deploy list** — act on these; everything else waits for its trigger:")
+                cols = st.columns(min(len(deployables), 3))
+                for i, (_t, _mbp) in enumerate(deployables[:6]):
+                    _a = _mbp.get("action", {}) or {}
+                    _ez = _a.get("entry_zone", (None, None))
+                    bcol = "#00c896" if _mbp.get("bucket") == "DEPLOY_NOW" else "#d4a843"
+                    with cols[i % len(cols)]:
+                        st.markdown(f"""
+                        <div class="pick-card" style="border-left:3px solid {bcol};margin-bottom:10px">
+                            <div class="ticker-name">{_t.get('Ticker')}</div>
+                            <div class="ticker-meta">₹{_t.get('Price ₹')} · {_mbp.get('bucket_label','')} · {_a.get('tranche_size','')}</div>
+                            <div class="target-row" style="font-size:0.74rem;color:#8896b3">
+                                Entry {_num(_ez[0])}–{_num(_ez[1])} · Stop {_num(_a.get('stop'))} · T1 {_num(_a.get('target_1'))}
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+            else:
+                st.caption("No Deploy/Starter names today — the market isn't offering a clean entry. "
+                           "The alert triggers below tell you exactly what has to happen first.")
+            with st.expander("How scoring works (methodology)"):
+                for topic, expl in METHODOLOGY_ROWS:
+                    st.markdown(f"**{topic}** — {expl}")
+
             if len(shortlist_df) <= SHORTLIST_FLOOR:
                 st.warning(f"Only {len(shortlist_df)} stocks passed the score threshold ({SHORTLIST_MIN_SCORE}). Showing the top {len(shortlist_df)} by score.")
             tickers = shortlist_df["Ticker"].tolist()
@@ -4366,7 +4582,7 @@ if "strategy" in st.session_state:
             tech_row = shortlist_df[shortlist_df["Ticker"] == selected_ticker].iloc[0].to_dict()
             if mb is None:
                 try:
-                    mb = compute_multibagger_signal(tech_row, m, sector_top5=top5_sectors_display)
+                    mb = compute_multibagger_signal(tech_row, m, sector_top5=top5_sectors_display, rec_action=rec.get("action"))
                 except Exception as e:
                     mb = _multibagger_safe_stub(str(e))
             score_v  = tech_row.get("Score")
@@ -4418,7 +4634,7 @@ if "strategy" in st.session_state:
                     except Exception as e:
                         rec = _recommend_action_safe_stub(str(e))
                     try:
-                        mb = compute_multibagger_signal(tech_row, metrics, sector_top5=top5_sectors_display)
+                        mb = compute_multibagger_signal(tech_row, metrics, sector_top5=top5_sectors_display, rec_action=rec.get("action"))
                     except Exception as e:
                         mb = _multibagger_safe_stub(str(e))
                     in_shortlist = (shortlist_df is not None and not shortlist_df.empty
