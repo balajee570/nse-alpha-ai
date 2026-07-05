@@ -69,6 +69,43 @@ def _yf_download(*args, **kwargs):
             pass
     return yf.download(*args, **kwargs)
 
+# NSE archives now return 403 to bare `requests.get(url, ...)` — same
+# Cloudflare-style tightening that hit yfinance earlier. Fix: real Chrome
+# TLS fingerprint (curl_cffi YF_SESSION) + browser headers + cookie
+# pre-flight on nseindia.com so the session presents itself as having
+# visited the homepage. Callers get None on failure and decide fallback.
+_NSE_HOMEPAGE = "https://www.nseindia.com/"
+_NSE_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": ("text/csv,text/plain,text/html,application/xhtml+xml,"
+               "application/xml;q=0.9,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": _NSE_HOMEPAGE,
+    "Connection": "keep-alive",
+}
+
+def _nse_get(url: str, *, timeout: int = 20):
+    """GET an NSE archive URL. Uses YF_SESSION's Chrome TLS fingerprint when
+    curl_cffi is installed, else falls back to a plain requests.Session with
+    browser headers. Pre-flights on the NSE homepage to seed cookies (NSE's
+    WAF expects a session that has visited the parent site recently).
+    Returns the response object or None on failure."""
+    sess = YF_SESSION if YF_SESSION is not None else requests.Session()
+    try:
+        try:
+            sess.get(_NSE_HOMEPAGE, headers=_NSE_BROWSER_HEADERS, timeout=10)
+        except Exception:
+            pass
+        r = sess.get(url, headers=_NSE_BROWSER_HEADERS, timeout=timeout)
+        if r.status_code == 200 and r.text and len(r.text) > 100:
+            return r
+    except Exception:
+        pass
+    return None
+
+
 # =============================
 # BACKGROUND JOB RUNNER
 # Lets the heavy pipeline (scan + AI + fundamentals) keep running even if
@@ -287,12 +324,10 @@ def get_etf_registry() -> pd.DataFrame:
     - Symbol length 3–20 chars
     - Series == 'EQ' if column present
     - Must contain ETF-like keyword in symbol OR name
+
+    Uses _nse_get (Chrome-fingerprinted session + cookie handshake) so it
+    survives the same Cloudflare tightening that broke get_nse_registry.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept"    : "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Referer"   : "https://www.nseindia.com/",
-    }
     candidates = [
         "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv",
         "https://nsearchives.nseindia.com/content/ETF/eq_etfseclist.csv",
@@ -308,8 +343,8 @@ def get_etf_registry() -> pd.DataFrame:
 
     for url in candidates:
         try:
-            r = requests.get(url, headers=headers, timeout=20)
-            if r.status_code != 200:
+            r = _nse_get(url)
+            if r is None:
                 continue
             df = pd.read_csv(io.StringIO(r.text))
             df.columns = df.columns.str.strip().str.upper()
@@ -683,25 +718,61 @@ def _safe_st_error(msg: str) -> None:
     try: st.error(msg)
     except Exception: print(f"[ERROR] {msg}")
 
+# NSE occasionally moves EQUITY_L between hosts; try each in order.
+_EQUITY_L_URLS = (
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://www1.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+)
+
+def _build_fallback_registry(reason: str) -> pd.DataFrame:
+    """When every live NSE URL fails, fall back to sorted(SECTOR_MAP) — the
+    ~85 most-watched EQ names already curated in the file. Scan runs on a
+    reduced universe but the app boots. Surfaces a yellow warning."""
+    fallback_syms = sorted(SECTOR_MAP.keys())
+    try:
+        st.warning(
+            f"⚠ NSE live registry unreachable ({reason}). Falling back to "
+            f"bundled {len(fallback_syms)}-stock list (SECTOR_MAP). Coverage "
+            f"is reduced; small/mid-caps missing until NSE reachable again."
+        )
+    except Exception:
+        print(f"[WARN] NSE registry fallback: {reason}")
+    df = pd.DataFrame({
+        "SYMBOL":    fallback_syms,
+        "SERIES":    "EQ",
+        "YF_SYMBOL": [s + ".NS" for s in fallback_syms],
+    })
+    return df
+
 @st.cache_data(ttl=86400)
 def get_nse_registry() -> pd.DataFrame:
-    url     = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        df.columns = df.columns.str.strip().str.upper()
-        missing = {"SERIES", "SYMBOL"} - set(df.columns)
-        if missing:
-            _safe_st_error(f"NSE format changed. Missing: {missing}")
-            return pd.DataFrame()
-        df = df[df["SERIES"] == "EQ"].copy()
-        df["YF_SYMBOL"] = df["SYMBOL"].astype(str).str.strip() + ".NS"
-        return df.reset_index(drop=True)
-    except Exception as e:
-        _safe_st_error(f"NSE registry download failed: {e}")
-        return pd.DataFrame()
+    """Fetch NSE EQUITY_L via _nse_get with multi-URL fallback; if every URL
+    fails, return the bundled SECTOR_MAP fallback. Only successful results
+    are cached (empty/error returns raise so st.cache_data doesn't poison
+    the cache with a failed fetch)."""
+    last_err = None
+    for url in _EQUITY_L_URLS:
+        try:
+            r = _nse_get(url)
+            if r is None:
+                last_err = f"{url}: no response / non-200"
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = df.columns.str.strip().str.upper()
+            missing = {"SERIES", "SYMBOL"} - set(df.columns)
+            if missing:
+                last_err = f"{url}: format changed, missing {missing}"
+                continue
+            df = df[df["SERIES"] == "EQ"].copy()
+            df["YF_SYMBOL"] = df["SYMBOL"].astype(str).str.strip() + ".NS"
+            return df.reset_index(drop=True)
+        except Exception as e:
+            last_err = f"{url}: {e}"
+            continue
+    # All live URLs failed. Return the bundled fallback (still gets cached
+    # so we don't hammer NSE for the next 24h).
+    return _build_fallback_registry(last_err or "all URLs failed")
 
 # =============================
 # TECHNICAL HELPERS
@@ -2486,6 +2557,250 @@ def _recommend_action_impl(metrics: dict, tech: dict, regime_label: str | None =
         "earnings_in_days": earnings_in_days,
     }
 
+# =============================
+# MULTIBAGGER SIGNAL — per-stock DEPLOY_NOW / STARTER / SET_ALERTS / CUT
+# Rule-based classifier that synthesises Stage + Grade + RS + Pattern +
+# fundamentals + liquidity into one opinionated verdict, matching the
+# voice of the user's worked example.
+# =============================
+
+def _safe_float(v, default=None):
+    try:
+        v = float(v)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+def _liquidity_verdict(turnover_cr) -> str:
+    v = _safe_float(turnover_cr, None)
+    if v is None: return "UNKNOWN"
+    if v < 1:     return "UNTRADEABLE"
+    if v < 5:     return "THIN"
+    return "OK"
+
+def _multibagger_score(m: dict, tech: dict, sector_in_top5: bool) -> int:
+    """Long-term multibagger potential 0-100, distinct from short-term Grade.
+    Combines growth + quality + runway (small-cap headroom) + tailwind +
+    setup optionality."""
+    rev_g = _safe_float(m.get("rev_cagr_3y"), 0) or 0
+    eps_g = _safe_float(m.get("eps_cagr_3y"), 0) or 0
+    growth = min(max((rev_g + eps_g) / 2, 0), 0.30) / 0.30  # 0..1
+
+    roe   = _safe_float(m.get("roe"), 0) or 0
+    roce  = _safe_float(m.get("roce"), 0) or 0
+    quality = min(max((roe + roce) / 2, 0), 0.35) / 0.35    # 0..1
+
+    mcap_cr = _safe_float(m.get("market_cap"), None)
+    if mcap_cr is None:
+        runway = 0.5
+    else:
+        mcap_cr = mcap_cr / 1e7
+        # Peak at ₹5,000 Cr, fall off both sides (small enough for room, big
+        # enough for institutional interest).
+        peak = 5000.0
+        if mcap_cr <= 0:
+            runway = 0.0
+        else:
+            ratio = mcap_cr / peak
+            runway = 1.0 / (1.0 + abs(math.log10(max(ratio, 1e-3))))
+    tailwind = 1.0 if sector_in_top5 else 0.4
+
+    stage_id = int(_safe_float(tech.get("StageId"), 0) or 0)
+    pat_q    = _safe_float(tech.get("Pattern Q"), 0) or 0
+    setup = 0.0
+    if stage_id in (1, 2):
+        setup = 0.6 + 0.4 * (pat_q / 100.0)
+    elif stage_id == 3:
+        setup = 0.5 + 0.3 * (pat_q / 100.0)
+    else:
+        setup = 0.2
+
+    score = 100 * (
+        0.30 * growth + 0.25 * quality + 0.20 * runway +
+        0.10 * tailwind + 0.15 * setup
+    )
+    return int(round(max(0, min(score, 100))))
+
+
+def _multibagger_reasons(m: dict, tech: dict, sector_in_top5: bool, sector_name: str | None) -> list:
+    """Deterministic voice-matched rationale bullets. Cap at 5, prioritise
+    the most differentiating signals."""
+    out = []
+
+    rsi = _safe_float(tech.get("RSI"), None)
+    macd = _safe_float(tech.get("MACD Hist"), None)
+    if rsi is not None and 40 <= rsi <= 55 and (macd is not None and macd > 0):
+        out.append(f"RSI {rsi:.0f} and turning up — MACD hist just crossed positive")
+
+    pat  = tech.get("Pattern")
+    patq = _safe_float(tech.get("Pattern Q"), None)
+    if pat and patq and patq >= 50:
+        out.append(f"{pat} base detected (quality {int(patq)}/100)")
+
+    obv  = _safe_float(tech.get("OBV Slope"), None)
+    volr = _safe_float(tech.get("Vol Ratio"), None)
+    if obv is not None and obv > 0 and volr is not None and volr >= 2.0:
+        out.append(f"Volume drying up on dips, {volr:.1f}× on last green day — OBV inflection")
+
+    pe   = _safe_float(m.get("pe_forward"), None) or _safe_float(m.get("pe_trailing"), None)
+    roce = _safe_float(m.get("roce"), None)
+    gap  = _safe_float(tech.get("Gap to 52W %"), None)
+    if pe is not None and pe > 0 and pe < 25 and gap is not None and gap < -30:
+        roce_txt = f", ROCE {roce*100:.0f}%" if roce else ""
+        out.append(f"Cheap for the setup (P/E {pe:.0f}{roce_txt}), +{abs(gap):.0f}% headroom to 52W high")
+
+    if sector_in_top5 and sector_name:
+        out.append(f"Sector {sector_name} in top-5 — tailwind")
+
+    stage_id = int(_safe_float(tech.get("StageId"), 0) or 0)
+    if stage_id == 4:
+        out.append("Stage 4 extended — climax risk, size accordingly if participating")
+
+    return out[:5]
+
+
+def _multibagger_safe_stub(reason: str = "unknown error") -> dict:
+    return {
+        "bucket": "SET_ALERTS", "bucket_label": "Set Alerts",
+        "reasons": [f"Multibagger signal unavailable: {reason}"],
+        "liquidity": {"avg_daily_turnover_cr": None, "verdict": "UNKNOWN"},
+        "multibagger_score": 0,
+        "action": {"entry_zone": (None, None), "stop": None, "target_1": None,
+                   "target_2": None, "tranche_size": "NONE", "add_trigger": ""},
+        "alert_trigger": None, "caveats": [], "sector": None,
+    }
+
+
+def compute_multibagger_signal(tech: dict, metrics: dict,
+                                sector_top5: set | None = None,
+                                shortlist_size: int = 25) -> dict:
+    """Rule-based DEPLOY_NOW / STARTER / SET_ALERTS / CUT classifier.
+    Reuses tech['Turnover ₹Cr'] added by PR #8 for the liquidity gate.
+    Returns a dict wired directly into fund_map[sym]['multibagger'].
+    """
+    m = metrics or {}
+    tech = tech or {}
+    price   = _safe_float(tech.get("Price ₹"), None)
+    turn_cr = _safe_float(tech.get("Turnover ₹Cr"), None)
+    stage_id = int(_safe_float(tech.get("StageId"), 0) or 0)
+    grade   = tech.get("Grade", "C")
+    score   = _safe_float(tech.get("Score"), 0) or 0
+    rs_rank = _safe_float(tech.get("RS Rank"), 0) or 0
+    pat_q   = _safe_float(tech.get("Pattern Q"), 0) or 0
+    rsi     = _safe_float(tech.get("RSI"), 50) or 50
+    vol_r   = _safe_float(tech.get("Vol Ratio"), 1.0) or 1.0
+    signal  = tech.get("Signal", "")
+    atr_pct = _safe_float(tech.get("ATR %"), 3.0) or 3.0
+
+    sector = SECTOR_MAP.get(tech.get("Ticker", ""))
+    sector_disp = _sector_display_name(sector)
+    sector_top5 = sector_top5 or set()
+    sector_in_top5 = sector_disp in sector_top5
+
+    liq_verdict = _liquidity_verdict(turn_cr)
+
+    # ── Bucket decision ─────────────────────────────────────────────
+    is_breakout   = signal == "Breakout"
+    reasons = _multibagger_reasons(m, tech, sector_in_top5, sector_disp)
+    caveats: list = []
+
+    if liq_verdict == "UNTRADEABLE":
+        bucket = "CUT"
+        bucket_label = "Cut — Illiquid"
+        reasons = [f"Under ₹1 Cr daily turnover (₹{turn_cr:.2f} Cr) — can't exit ₹5 L cleanly"] + reasons[:2]
+    elif stage_id == 4 and grade in ("B", "C"):
+        bucket = "CUT"
+        bucket_label = "Cut — Extended"
+        reasons = ["Stage 4 climax without A-grade confluence — reward not worth chase"] + reasons[:2]
+    elif score < 50 and pat_q < 50:
+        bucket = "CUT"
+        bucket_label = "Cut — Weak setup"
+        reasons = [f"Composite Score {score:.0f} with no confirmed base"] + reasons[:2]
+    elif (liq_verdict == "OK" and stage_id in (2, 3) and grade in ("A+", "A")
+          and rs_rank >= 80
+          and (pat_q >= 65 or (is_breakout and vol_r > 1.8))):
+        bucket = "DEPLOY_NOW"
+        bucket_label = "Deploy Now"
+        if not reasons:
+            reasons = [f"Grade {grade}, RS Rank {int(rs_rank)}, Stage {stage_id}"]
+    elif (liq_verdict in ("OK", "THIN") and stage_id in (1, 2)
+          and 40 <= rsi <= 55 and pat_q >= 50 and grade in ("A+", "A", "B+")):
+        bucket = "STARTER"
+        bucket_label = "Starter Tranche"
+        if liq_verdict == "THIN":
+            caveats.append(f"Thin liquidity (₹{turn_cr:.1f} Cr/day) — starter sizing only")
+    else:
+        bucket = "SET_ALERTS"
+        bucket_label = "Set Alerts"
+
+    # ── Action strip (entry / stop / targets / tranche) ─────────────
+    entry_low, entry_high = None, None
+    stop = None
+    target_1, target_2 = None, None
+    tranche = "NONE"
+    add_trigger = ""
+    alert_trigger = None
+
+    if price and math.isfinite(price):
+        # ATR-based stop (2×ATR%), entry zone below current price.
+        stop = round(price * (1 - 2 * atr_pct / 100), 2)
+        entry_low  = round(price * (1 - 0.5 * atr_pct / 100), 2)
+        entry_high = round(price, 2)
+
+        # Reuse recommend_action-style tiered targets when available.
+        target_1 = _safe_float(tech.get("Target ₹"), None)
+        high52   = _safe_float(tech.get("52W High ₹"), None)
+        if high52 and high52 > price:
+            target_2 = round(high52, 2)
+        elif target_1:
+            target_2 = round(price * 1.30, 2)
+
+        if bucket == "DEPLOY_NOW":
+            tranche = "FULL"
+            add_trigger = "add on strong close above pivot"
+        elif bucket == "STARTER":
+            tranche = "STARTER"
+            add_trigger = f"add above ₹{round(price * 1.06, 2)} on volume"
+        elif bucket == "SET_ALERTS":
+            tranche = "NONE"
+            # Alert trigger = 20-day pivot from breakout lookback, else pattern pivot.
+            piv = None
+            try:
+                piv = _safe_float(tech.get("52W High ₹"), None)
+                # Prefer nearer pivot if pattern gave one.
+                if isinstance(tech.get("Pattern"), str):
+                    # Pattern key_levels aren't in tech row, so approx as 5% above price
+                    piv = round(price * 1.05, 2)
+            except Exception:
+                pass
+            alert_trigger = f"reclaim ₹{piv or round(price * 1.05, 2)} on volume"
+        else:  # CUT
+            tranche = "NONE"
+
+    # Post-IPO caveat if listing is young — approx via mcap + missing history flags
+    if not reasons:
+        reasons = [f"Grade {grade}, Score {score:.0f}, Stage {stage_id}"]
+
+    return {
+        "bucket":       bucket,
+        "bucket_label": bucket_label,
+        "reasons":      reasons,
+        "liquidity":    {"avg_daily_turnover_cr": turn_cr, "verdict": liq_verdict},
+        "multibagger_score": _multibagger_score(m, tech, sector_in_top5),
+        "action": {
+            "entry_zone":  (entry_low, entry_high),
+            "stop":        stop,
+            "target_1":    target_1,
+            "target_2":    target_2,
+            "tranche_size": tranche,
+            "add_trigger": add_trigger,
+        },
+        "alert_trigger": alert_trigger,
+        "caveats":       caveats,
+        "sector":        sector_disp,
+    }
+
+
 def analyze_stock_fundamentals(symbol: str, technicals_row: dict) -> dict:
     """Fetch fundamentals (cached) and merge with technicals into a recommendation."""
     metrics = fetch_fundamentals(symbol)
@@ -2898,7 +3213,7 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
         if scan_df is not None and not scan_df.empty:
             scan_df.to_excel(writer, sheet_name="Full Scan", index=False)
 
-        rows_summary, rows_val, rows_q, rows_g, rows_o, rows_rec = [], [], [], [], [], []
+        rows_summary, rows_val, rows_q, rows_g, rows_o, rows_rec, rows_mb = [], [], [], [], [], [], []
 
         for _, t_row in shortlist_df.iterrows():
             ticker_no = t_row["Ticker"]
@@ -2910,8 +3225,33 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
                 rec = payload["recommendation"]
             else:
                 rec = recommend_action(m, t_row.to_dict())
+            mb = payload.get("multibagger") if payload else None
+            if mb is None:
+                try:
+                    mb = compute_multibagger_signal(t_row.to_dict(), m)
+                except Exception as e:
+                    mb = _multibagger_safe_stub(str(e))
 
             rows_summary.append(_flatten_metrics(ticker_no, m, t_row.to_dict(), rec))
+            mb_action = mb.get("action", {}) or {}
+            mb_ez = mb_action.get("entry_zone", (None, None))
+            mb_liq = mb.get("liquidity", {}) or {}
+            rows_mb.append({
+                "Ticker": ticker_no,
+                "Bucket": mb.get("bucket_label"),
+                "Multibagger Score": mb.get("multibagger_score"),
+                "Entry Low": mb_ez[0], "Entry High": mb_ez[1],
+                "Stop": mb_action.get("stop"),
+                "Target 1": mb_action.get("target_1"),
+                "Target 2": mb_action.get("target_2"),
+                "Tranche": mb_action.get("tranche_size"),
+                "Add Trigger": mb_action.get("add_trigger"),
+                "Alert Trigger": mb.get("alert_trigger"),
+                "Avg Daily Turnover ₹Cr": mb_liq.get("avg_daily_turnover_cr"),
+                "Liquidity Verdict": mb_liq.get("verdict"),
+                "Reasons": " | ".join(mb.get("reasons", [])),
+                "Caveats": " | ".join(mb.get("caveats", [])),
+            })
             dcf = m.get("dcf") or {}
             rows_val.append({
                 "Ticker": ticker_no,
@@ -2989,6 +3329,7 @@ def build_excel_workbook(scan_df: pd.DataFrame, shortlist_df: pd.DataFrame, fund
         pd.DataFrame(rows_g).to_excel(writer,       sheet_name="Growth",         index=False)
         pd.DataFrame(rows_o).to_excel(writer,       sheet_name="Ownership",      index=False)
         pd.DataFrame(rows_rec).to_excel(writer,     sheet_name="Recommendation", index=False)
+        pd.DataFrame(rows_mb).to_excel(writer,      sheet_name="Multibagger",    index=False)
 
         # Per-stock vertical sheets (cap 25)
         for _, t_row in shortlist_df.head(25).iterrows():
@@ -3338,7 +3679,11 @@ def _run_pipeline(cb=None) -> dict:
                 rec = recommend_action(m, tech, regime.get("label", "SELECTIVE"))
             except Exception as e:
                 rec = _recommend_action_safe_stub(str(e))
-            fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec}
+            try:
+                mb = compute_multibagger_signal(tech, m, sector_top5=top5_sectors)
+            except Exception as e:
+                mb = _multibagger_safe_stub(str(e))
+            fund_map[sym] = {"metrics": m, "technicals": tech, "recommendation": rec, "multibagger": mb}
 
     result = {
         "momentum_df":     momentum_df,
@@ -3448,7 +3793,8 @@ elif (_read_status() or {}).get("error"):
 
 def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict,
                            context_label: str = "",
-                           intel_summary: str = "") -> None:
+                           intel_summary: str = "",
+                           multibagger: dict | None = None) -> None:
     """Render the full per-stock deep dive UI. Used by both the shortlist
     selectbox path (Deep Dive tab) and the ad-hoc Search Stock tab."""
     m = metrics or {}
@@ -3512,10 +3858,68 @@ def render_deep_dive_panel(ticker: str, tech_row: dict, metrics: dict, rec: dict
     sc3.metric("Value",   f"{scores.get('value','—')}")
     sc4.metric("Growth",  f"{scores.get('growth','—')}")
 
-    # Sub-tabs for fundamentals
-    stab_v, stab_q, stab_g, stab_o, stab_th = st.tabs(
-        ["Valuation", "Quality", "Growth", "Ownership", "Bull/Bear & Targets"]
+    # Sub-tabs for fundamentals — Multibagger Signal first since it's the
+    # headline synthesis the user wants to see immediately.
+    stab_mb, stab_v, stab_q, stab_g, stab_o, stab_th = st.tabs(
+        ["Multibagger Signal", "Valuation", "Quality", "Growth", "Ownership", "Bull/Bear & Targets"]
     )
+
+    with stab_mb:
+        mb = multibagger or {}
+        if not mb:
+            st.info("Multibagger signal unavailable for this stock.")
+        else:
+            bucket = mb.get("bucket", "SET_ALERTS")
+            bucket_label = mb.get("bucket_label", "Set Alerts")
+            mb_color = {"DEPLOY_NOW": "#00c896", "STARTER": "#d4a843",
+                        "SET_ALERTS": "#4f8ef7", "CUT": "#f87171"}.get(bucket, "#8896b3")
+            mb_score = mb.get("multibagger_score", 0)
+            liq = mb.get("liquidity", {}) or {}
+            turn_v = liq.get("avg_daily_turnover_cr")
+            turn_s = f"₹{turn_v:.2f} Cr" if isinstance(turn_v, (int, float)) and np.isfinite(turn_v) else "—"
+
+            st.markdown(f"""
+            <div class="pick-card" style="margin-top:4px;border-left:3px solid {mb_color}">
+                <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+                    <span class="upside-pill" style="background:{mb_color};color:#0a0a0a;font-size:0.95rem;padding:6px 18px">
+                        {bucket_label}
+                    </span>
+                    <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                        Multibagger Score <strong style="color:#f0c96a;font-size:1.1rem">{mb_score}</strong> / 100
+                    </span>
+                    <span style="font-family:JetBrains Mono,monospace;color:#8896b3">
+                        Liquidity <strong style="color:#eef2ff">{turn_s}</strong> ({liq.get('verdict', '—')})
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.progress(min(max(int(mb_score), 0), 100))
+
+            reasons = mb.get("reasons") or []
+            if reasons:
+                st.markdown("**Why:**")
+                for r in reasons:
+                    st.markdown(f"- {r}")
+
+            action = mb.get("action", {}) or {}
+            ez = action.get("entry_zone", (None, None))
+            ac1, ac2, ac3, ac4, ac5 = st.columns(5)
+            ac1.metric("Entry Zone ₹", f"{_num(ez[0])} – {_num(ez[1])}")
+            ac2.metric("Stop ₹", _num(action.get("stop")))
+            ac3.metric("Target 1 ₹", _num(action.get("target_1")))
+            ac4.metric("Target 2 ₹", _num(action.get("target_2")))
+            ac5.metric("Tranche", action.get("tranche_size", "—"))
+
+            if action.get("add_trigger"):
+                st.caption(f"Add trigger: {action['add_trigger']}")
+            if bucket == "SET_ALERTS" and mb.get("alert_trigger"):
+                st.warning(f"⏰ Alert: {mb['alert_trigger']}")
+
+            caveats = mb.get("caveats") or []
+            if caveats:
+                st.markdown("**Caveats:**")
+                for c in caveats:
+                    st.caption(f"⚠ {c}")
 
     with stab_v:
         dcf = m.get("dcf") or {}
@@ -3770,6 +4174,7 @@ if "strategy" in st.session_state:
     early_rally_df = st.session_state.get("early_rally_df", pd.DataFrame())
     sector_df_st   = st.session_state.get("sector_df", pd.DataFrame())
     sector_strength= st.session_state.get("sector_strength", pd.DataFrame())
+    top5_sectors_display = top_sectors_set(sector_strength, top_n=5)
     regime         = st.session_state.get("regime", {}) or {}
     fund_map       = st.session_state.get("fund_map", {})
     intel_summary  = st.session_state.get("intel_summary", "")
@@ -3957,12 +4362,18 @@ if "strategy" in st.session_state:
             payload = fund_map.get(yf_sym, {})
             m       = payload.get("metrics", {}) if payload else {}
             rec     = payload.get("recommendation", {}) if payload else {}
+            mb      = payload.get("multibagger") if payload else None
             tech_row = shortlist_df[shortlist_df["Ticker"] == selected_ticker].iloc[0].to_dict()
+            if mb is None:
+                try:
+                    mb = compute_multibagger_signal(tech_row, m, sector_top5=top5_sectors_display)
+                except Exception as e:
+                    mb = _multibagger_safe_stub(str(e))
             score_v  = tech_row.get("Score")
             ctx_label = f"From shortlist · score {score_v:.0f}" if score_v is not None else "From shortlist"
             render_deep_dive_panel(
                 selected_ticker, tech_row, m, rec,
-                context_label=ctx_label, intel_summary=intel_summary,
+                context_label=ctx_label, intel_summary=intel_summary, multibagger=mb,
             )
 
     # =======================================================
@@ -4006,12 +4417,16 @@ if "strategy" in st.session_state:
                                                (regime or {}).get("label", "SELECTIVE"))
                     except Exception as e:
                         rec = _recommend_action_safe_stub(str(e))
+                    try:
+                        mb = compute_multibagger_signal(tech_row, metrics, sector_top5=top5_sectors_display)
+                    except Exception as e:
+                        mb = _multibagger_safe_stub(str(e))
                     in_shortlist = (shortlist_df is not None and not shortlist_df.empty
                                     and picked_symbol in set(shortlist_df["Ticker"].astype(str)))
                     ctx_label = "Ad-hoc lookup · in shortlist" if in_shortlist else "Ad-hoc lookup · not in shortlist"
                     render_deep_dive_panel(
                         picked_symbol, tech_row, metrics, rec,
-                        context_label=ctx_label, intel_summary=intel_summary,
+                        context_label=ctx_label, intel_summary=intel_summary, multibagger=mb,
                     )
             else:
                 st.info("Select a stock from the dropdown above to see its full deep dive.")
