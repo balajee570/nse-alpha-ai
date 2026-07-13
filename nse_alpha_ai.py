@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import io
 import os
+import sys
 import json
 import uuid
 import time
@@ -12,6 +13,7 @@ import logging
 import warnings
 import threading
 import tempfile
+import subprocess
 from pathlib import Path
 import streamlit as st
 import requests
@@ -44,26 +46,66 @@ def fmt_ist(fmt: str = "%d %b %Y · %H:%M IST") -> str:
 # Ticker.info / .financials / .balance_sheet to fail with HTTP 401 "Invalid
 # Crumb" using the default requests session. curl_cffi impersonates a real
 # Chrome TLS fingerprint and bypasses the block.
-try:
-    from curl_cffi import requests as _cf_requests
-    YF_SESSION = _cf_requests.Session(impersonate="chrome")
-except Exception:
-    YF_SESSION = None
+#
+# CRITICAL: curl_cffi is a native extension. On some Python builds (observed:
+# CPython 3.14 on Streamlit Cloud, July 2026) creating the Session SEGFAULTS —
+# and a segfault in native code kills the whole process with no traceback;
+# try/except cannot catch it. So we (a) never touch curl_cffi at import time,
+# and (b) probe Session creation in a THROWAWAY SUBPROCESS first: if the
+# child dies, the parent survives and we fall back to plain requests
+# (degraded WAF bypass, but the app boots).
+_YF_SESSION_STATE = {"probed": False, "session": None}
+
+_CURL_CFFI_PROBE = (
+    "from curl_cffi import requests as r; "
+    "s = r.Session(impersonate='chrome'); print('CURL_CFFI_OK')"
+)
+
+def _curl_cffi_is_safe() -> bool:
+    """Create a curl_cffi Session in a subprocess. A SIGSEGV there returns a
+    nonzero returncode here instead of killing Streamlit."""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", _CURL_CFFI_PROBE],
+            capture_output=True, timeout=30,
+        )
+        return r.returncode == 0 and b"CURL_CFFI_OK" in r.stdout
+    except Exception:
+        return False
+
+def get_yf_session():
+    """Lazy, probe-guarded curl_cffi session. Returns None (plain-requests
+    fallback everywhere) when curl_cffi is missing or unsafe on this build."""
+    state = _YF_SESSION_STATE
+    if not state["probed"]:
+        state["probed"] = True
+        if _curl_cffi_is_safe():
+            try:
+                from curl_cffi import requests as _cf_requests
+                state["session"] = _cf_requests.Session(impersonate="chrome")
+            except Exception:
+                state["session"] = None
+        else:
+            print("[WARN] curl_cffi probe failed on this Python build — "
+                  "falling back to plain requests (WAF bypass disabled).")
+    return state["session"]
 
 def _yf_ticker(symbol: str):
     """Return a yf.Ticker bound to the impersonating session when available."""
-    if YF_SESSION is not None:
+    sess = get_yf_session()
+    if sess is not None:
         try:
-            return yf.Ticker(symbol, session=YF_SESSION)
+            return yf.Ticker(symbol, session=sess)
         except Exception:
             pass
     return yf.Ticker(symbol)
 
 def _yf_download(*args, **kwargs):
     """yf.download wrapper that passes the curl_cffi session when supported."""
-    if YF_SESSION is not None and "session" not in kwargs:
+    sess = get_yf_session()
+    if sess is not None and "session" not in kwargs:
         try:
-            return yf.download(*args, session=YF_SESSION, **kwargs)
+            return yf.download(*args, session=sess, **kwargs)
         except TypeError:
             # yfinance version doesn't accept session=; fall through
             pass
@@ -71,7 +113,7 @@ def _yf_download(*args, **kwargs):
 
 # NSE archives now return 403 to bare `requests.get(url, ...)` — same
 # Cloudflare-style tightening that hit yfinance earlier. Fix: real Chrome
-# TLS fingerprint (curl_cffi YF_SESSION) + browser headers + cookie
+# TLS fingerprint (probe-guarded curl_cffi session) + browser headers + cookie
 # pre-flight on nseindia.com so the session presents itself as having
 # visited the homepage. Callers get None on failure and decide fallback.
 _NSE_HOMEPAGE = "https://www.nseindia.com/"
@@ -87,12 +129,13 @@ _NSE_BROWSER_HEADERS = {
 }
 
 def _nse_get(url: str, *, timeout: int = 20):
-    """GET an NSE archive URL. Uses YF_SESSION's Chrome TLS fingerprint when
-    curl_cffi is installed, else falls back to a plain requests.Session with
-    browser headers. Pre-flights on the NSE homepage to seed cookies (NSE's
-    WAF expects a session that has visited the parent site recently).
-    Returns the response object or None on failure."""
-    sess = YF_SESSION if YF_SESSION is not None else requests.Session()
+    """GET an NSE archive URL. Uses the probe-guarded curl_cffi session's
+    Chrome TLS fingerprint when available, else falls back to a plain
+    requests.Session with browser headers. Pre-flights on the NSE homepage to
+    seed cookies (NSE's WAF expects a session that has visited the parent
+    site recently). Returns the response object or None on failure."""
+    _cf = get_yf_session()
+    sess = _cf if _cf is not None else requests.Session()
     try:
         try:
             sess.get(_NSE_HOMEPAGE, headers=_NSE_BROWSER_HEADERS, timeout=10)
