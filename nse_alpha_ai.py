@@ -45,15 +45,20 @@ def fmt_ist(fmt: str = "%d %b %Y · %H:%M IST") -> str:
 # Yahoo Finance recently tightened crumb / Cloudflare checks, which causes
 # Ticker.info / .financials / .balance_sheet to fail with HTTP 401 "Invalid
 # Crumb" using the default requests session. curl_cffi impersonates a real
-# Chrome TLS fingerprint and bypasses the block.
+# Chrome TLS fingerprint and bypasses the block — WHEN it's safe to use.
 #
-# CRITICAL: curl_cffi is a native extension. On some Python builds (observed:
-# CPython 3.14 on Streamlit Cloud, July 2026) creating the Session SEGFAULTS —
-# and a segfault in native code kills the whole process with no traceback;
-# try/except cannot catch it. So we (a) never touch curl_cffi at import time,
-# and (b) probe Session creation in a THROWAWAY SUBPROCESS first: if the
-# child dies, the parent survives and we fall back to plain requests
-# (degraded WAF bypass, but the app boots).
+# CRITICAL: curl_cffi is a native extension. On Streamlit Cloud's Python 3.14
+# build (observed July 2026) it segfaults the ENTIRE process at boot, before
+# any of our code runs — even with our own Session-creation fully deferred
+# and subprocess-probed, which only proves it isn't OUR call site that's
+# crashing (most likely yfinance imports/uses curl_cffi internally at its
+# own module level, bypassing any guard we put around our own usage).
+# curl_cffi is therefore REMOVED from requirements.txt — this whole block is
+# now dead code on a normal deploy (ImportError inside the probe subprocess
+# -> get_yf_session() returns None -> every caller already falls back to
+# plain requests). Left in place, unchanged, so re-adding curl_cffi to
+# requirements.txt later (once a working wheel exists for the deployed
+# Python) is a one-line change with the segfault protection already built in.
 _YF_SESSION_STATE = {"probed": False, "session": None}
 
 _CURL_CFFI_PROBE = (

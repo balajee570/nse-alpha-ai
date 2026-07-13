@@ -5,5 +5,11 @@ numpy
 yfinance>=0.2.65
 tavily-python
 openpyxl
-curl_cffi  # optional WAF bypass; guarded by subprocess probe (segfaults on some Python builds)
 streamlit-autorefresh
+# curl_cffi intentionally NOT installed: on Streamlit Cloud's Python 3.14
+# build it segfaults the whole process at boot (before any of our code
+# runs), even with our own usage fully lazy/subprocess-probed — most likely
+# imported eagerly by yfinance itself, bypassing our guard entirely. The
+# app runs fine without it (plain-requests fallback everywhere is already
+# implemented). Re-add only after confirming a working wheel for the
+# deployed Python version.
