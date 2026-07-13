@@ -5,5 +5,5 @@ numpy
 yfinance>=0.2.65
 tavily-python
 openpyxl
-curl_cffi
+curl_cffi  # optional WAF bypass; guarded by subprocess probe (segfaults on some Python builds)
 streamlit-autorefresh
