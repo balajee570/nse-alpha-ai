@@ -1,8 +1,34 @@
 from __future__ import annotations
+import sys
+
+# ============================================================================
+# CURL_CFFI KILL-SWITCH — must run before `import yfinance` below, since
+# yfinance may import/use curl_cffi internally at its own module level (our
+# hypothesis for two prior segfault fixes not sticking — unverified, no
+# PyPI access in dev to confirm yfinance's internals directly). On Streamlit
+# Cloud's Python 3.14 build curl_cffi is a native extension that segfaults
+# the ENTIRE process just from being imported — no Python exception, no
+# traceback, the whole interpreter dies. Removing curl_cffi from
+# requirements.txt did NOT fix this: Streamlit Cloud's incremental deploy
+# reused the persistent venv and never actually pruned it from disk
+# ("Resolved 64... Audited 64 packages" — identical count to the build that
+# had it, meaning `pip install -r requirements.txt` only adds/upgrades what
+# is listed, it never uninstalls a package that's been removed from the
+# file). So we can't rely on curl_cffi being absent — we hard-block it from
+# ever being imported into THIS process instead, regardless of whether it's
+# physically on disk. `sys.modules[name] = None` is the standard CPython
+# mechanism: any subsequent `import curl_cffi` anywhere — ours or a
+# library's internal one — raises a clean, catchable ImportError instead of
+# loading the native code. This must be the first thing that runs, before
+# any other import in this file (in particular before `import yfinance`
+# further down), since a crash during that unconditional top-level import
+# happens before any of our own guard logic ever gets a chance to run.
+sys.modules["curl_cffi"] = None
+sys.modules["curl_cffi.requests"] = None
+
 import re
 import io
 import os
-import sys
 import json
 import uuid
 import time
